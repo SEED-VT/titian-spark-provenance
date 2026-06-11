@@ -83,10 +83,30 @@ Mechanism notes added during implementation:
   LAggregator wrapper's per-merge Tuple2 allocation (TOUCHPOINT_INVENTORY notes it) and
   per-record `toString` murmur hashing. Optimization pass warranted.
 
-Phase 4 still remaining: ROLLUP grouping-id keying, Python UDF taps + PySpark wrapper,
-DSv2/cached relations/writes, full-row show, distributed trace joins (cursor collects
-to driver), block lifecycle (tap blocks not ContextCleaner-tracked), proper TPC-H
-benchmark at scale. All unsupported shapes fail loudly per caveat 4.
+## Status (2026-06-10, phase 4 second pass): 35/35 tests green
+
+Added and verified:
+- **Columnar scans (Parquet/ORC).** The row-based `TapScanExec` is inserted above the
+  columnar scan in preColumnarTransitions; Spark's own transition inserter (which runs
+  after) places `ColumnarToRowExec` between them, so ids are assigned at the row
+  boundary, still inside whole-stage codegen. `show()` re-scans via `executeColumnar`
+  + batch flattening (same row order).
+- **ROLLUP/CUBE/GROUPING SETS** via visible-subset keying: both taps drop the
+  synthetic `spark_grouping_id` from their key sets, so per-grouping-set rows and
+  grand totals trace correctly. Coarsening caveat: grouping sets whose *visible* key
+  values coincide (e.g. a natural NULL vs a rolled-up NULL) are conflated — a union of
+  witnesses, never a wrong direction. If a *visible* grouping column is dropped from
+  the output, capture still fails loudly.
+- **Full-source-row `show(full = true)`**: re-executes the captured scan with the
+  complete data schema (same FilePartitions/order) when nothing was pushed into the
+  reader (`dataFilters` empty, unpartitioned table); falls back to the pruned view
+  otherwise.
+
+Phase 4 still remaining: Python UDF taps + PySpark wrapper (needs a pyspark test
+harness), DSv2 scans, cached relations (`InMemoryRelation`), writes as result taps,
+distributed trace joins (cursor collects to driver), block lifecycle (tap blocks not
+ContextCleaner-tracked), at-scale benchmark. All unsupported shapes fail loudly per
+caveat 4.
 
 ## Status (2026-06-10): Phases 0 and 1 DONE
 

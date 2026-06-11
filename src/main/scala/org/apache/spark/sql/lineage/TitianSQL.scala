@@ -224,20 +224,56 @@ object TitianSQL {
   private[lineage] def showScanRows(
       spark: SparkSession,
       scan: FileSourceScanExec,
-      inputIds: Seq[Long]): Array[Row] = {
-    val wanted = inputIds.toSet
-    val matched = scan.execute().mapPartitionsInternal { iter =>
-      val split = TaskContext.getPartitionId()
-      var idx = -1
-      iter.flatMap { row =>
-        idx += 1
-        if (wanted.contains(PackIntIntoLong(split, idx))) {
-          Iterator.single(row.copy())
-        } else Iterator.empty
+      inputIds: Seq[Long],
+      full: Boolean = false): Array[Row] = {
+    // Full-source-row mode: re-execute the same scan (same FilePartitions, same
+    // in-split row order) but with the complete data schema instead of the pruned
+    // one. Only safe when nothing was pushed into the reader that could change the
+    // emitted row set/order — otherwise fall back to the pruned view.
+    val effective =
+      if (full && scan.dataFilters.isEmpty &&
+          scan.relation.partitionSchema.isEmpty &&
+          scan.requiredSchema != scan.relation.dataSchema) {
+        val fullAttrs = scan.relation.dataSchema.fields.toSeq.map { f =>
+          org.apache.spark.sql.catalyst.expressions.AttributeReference(
+            f.name, f.dataType, f.nullable)()
+        }
+        scan.copy(output = fullAttrs, requiredSchema = scan.relation.dataSchema)
+      } else {
+        scan
       }
-    }.collect()
+    val wanted = inputIds.toSet
+    val matched = (if (effective.supportsColumnar) {
+      // columnar scans emit ColumnarBatch; flatten in batch order — identical to the
+      // row order ColumnarToRow produced at capture time
+      effective.executeColumnar().mapPartitionsInternal { batches =>
+        val split = TaskContext.getPartitionId()
+        var idx = -1
+        batches.flatMap { batch =>
+          scala.jdk.CollectionConverters.IteratorHasAsScala(batch.rowIterator())
+            .asScala.flatMap { row =>
+              idx += 1
+              if (wanted.contains(PackIntIntoLong(split, idx))) {
+                Iterator.single(row.copy())
+              } else Iterator.empty
+            }
+        }
+      }
+    } else {
+      effective.execute().mapPartitionsInternal { iter =>
+        val split = TaskContext.getPartitionId()
+        var idx = -1
+        iter.flatMap { row =>
+          idx += 1
+          if (wanted.contains(PackIntIntoLong(split, idx))) {
+            Iterator.single(row.copy())
+          } else Iterator.empty
+        }
+      }
+    }).collect()
     val converter =
-      org.apache.spark.sql.catalyst.CatalystTypeConverters.createToScalaConverter(scan.schema)
+      org.apache.spark.sql.catalyst.CatalystTypeConverters
+        .createToScalaConverter(effective.schema)
     matched.map(r => converter(r).asInstanceOf[Row])
   }
 }
@@ -315,8 +351,14 @@ class TraceCursor private[lineage] (
   }
 
   /** Resolve source rows; only valid at a scan level. */
-  def show(): Array[Row] = source match {
-    case ScanSource(scan) => TitianSQL.showScanRows(spark, scan, ids.toSeq)
+  def show(): Array[Row] = show(full = false)
+
+  /**
+   * Resolve source rows; with `full = true`, return complete source records (all
+   * columns) instead of the query's pruned view, when the scan shape allows it.
+   */
+  def show(full: Boolean): Array[Row] = source match {
+    case ScanSource(scan) => TitianSQL.showScanRows(spark, scan, ids.toSeq, full)
     case _ => throw new UnsupportedOperationException(
       "show() resolves source rows — goBack to a scan level first")
   }

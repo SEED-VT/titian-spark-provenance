@@ -89,15 +89,18 @@ case class InsertTitianTaps(session: SparkSession) extends Rule[SparkPlan] with 
     validateSupported(plan)
 
     var tapped = plan.transformUp {
-      // input ids at the sources
-      case scan: FileSourceScanExec if !scan.supportsColumnar =>
+      // input ids at the sources. For columnar scans (Parquet/ORC) the transition
+      // inserter, which runs after this rule, places ColumnarToRowExec between the
+      // scan and this row-based tap — ids are assigned at the row boundary.
+      case scan: FileSourceScanExec =>
         TapScanExec(scan)
 
       // map-side capture: below the partial aggregate when the exchange feeds one
       case ex: ShuffleExchangeExec => ex.child match {
         case agg: HashAggregateExec if !agg.child.isInstanceOf[TapPreExchangeExec] =>
           val pre = TapPreExchangeExec(
-            session.sparkContext.newRddId(), agg.groupingExpressions, agg.child)
+            session.sparkContext.newRddId(), visibleGroupKeys(agg.groupingExpressions),
+            agg.child)
           ex.withNewChildren(Seq(agg.withNewChildren(Seq(pre))))
         case agg: HashAggregateExec => ex
         case _: TapPreExchangeExec => ex
@@ -128,7 +131,8 @@ case class InsertTitianTaps(session: SparkSession) extends Rule[SparkPlan] with 
         // The grouping values may surface in the output under an Alias (e.g.
         // GROUP BY upper(c) ... SELECT upper(c) AS x): resolve each grouping attr to
         // the output attribute that carries its value.
-        val keyAttrs = agg.groupingExpressions.map(_.toAttribute).map { g =>
+        val keyAttrs = visibleGroupKeys(agg.groupingExpressions)
+          .map(_.toAttribute).map { g =>
           agg.resultExpressions.collectFirst {
             case ar: org.apache.spark.sql.catalyst.expressions.AttributeReference
               if ar.exprId == g.exprId => ar
@@ -182,6 +186,18 @@ case class InsertTitianTaps(session: SparkSession) extends Rule[SparkPlan] with 
     name.contains("Command") || name.contains("LocalTableScan")
   }
 
+  /**
+   * Grouping keys minus the synthetic grouping id that Expand adds for ROLLUP/CUBE/
+   * GROUPING SETS. The id rarely survives into the aggregate output, so both taps key
+   * on the visible subset — associations stay consistent at the cost of conflating
+   * grouping sets whose visible key values coincide (a coarsening, never a wrong
+   * direction).
+   */
+  private def visibleGroupKeys(groupingExpressions: Seq[
+      org.apache.spark.sql.catalyst.expressions.NamedExpression]): Seq[
+      org.apache.spark.sql.catalyst.expressions.NamedExpression] =
+    groupingExpressions.filterNot(_.name == "spark_grouping_id")
+
   private val supportedJoinTypes: Set[JoinType] =
     Set(Inner, LeftOuter, RightOuter, FullOuter, LeftSemi, LeftAnti)
 
@@ -215,8 +231,7 @@ case class InsertTitianTaps(session: SparkSession) extends Rule[SparkPlan] with 
   private def validateSupported(plan: SparkPlan): Unit = {
     plan.foreach {
       case _: TitianTapExec => // ours
-      case scan: FileSourceScanExec =>
-        if (scan.supportsColumnar) throw new TitianUnsupportedOperatorException(scan)
+      case _: FileSourceScanExec => // row-based or columnar (ColumnarToRow boundary)
       case _: FilterExec | _: ProjectExec => // pass-through
       case _: ExpandExec | _: GenerateExec => // 1->N within the pipeline: the
         // generated rows are consumed depth-first per input row, so currentInputId

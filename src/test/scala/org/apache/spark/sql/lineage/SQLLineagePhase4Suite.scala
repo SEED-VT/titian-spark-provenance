@@ -166,15 +166,63 @@ class SQLLineagePhase4Suite extends AnyFunSuite with BeforeAndAfterEach with Mat
     cursor.ids should have length 16
   }
 
-  test("ROLLUP still fails loudly (grouping-id not in output)") {
+  test("ROLLUP — per-category and grand-total rows trace correctly") {
     val s = newSession(broadcast = true)
     registerViews(s)
     val df = s.sql(
-      "SELECT category, SUM(amount) FROM sales GROUP BY ROLLUP(category)")
-    val e = intercept[Exception] { df.collect() }
-    def causes(t: Throwable): Seq[Throwable] =
-      if (t == null) Nil else t +: causes(t.getCause)
-    assert(causes(e).exists(_.isInstanceOf[TitianUnsupportedOperatorException]),
-      s"expected TitianUnsupportedOperatorException, got: $e")
+      "SELECT category, SUM(amount) AS total FROM sales GROUP BY ROLLUP(category)")
+    val output = TitianSQL.collectWithLineage(df)
+    output should have length 5 // 4 categories + grand total
+
+    // grand total (category NULL) depends on every input row
+    val totalId = output.find(_._1.isNullAt(0)).get._2
+    val totalCursor = TitianSQL.trace(df, Seq(totalId)).goBack()
+    totalCursor.ids should have length 16
+
+    // a category row traces to exactly its category's inputs
+    val electronicsId = output.find(r =>
+      !r._1.isNullAt(0) && r._1.getString(0) == "electronics").get._2
+    val catCursor = TitianSQL.trace(df, Seq(electronicsId)).goBack()
+    catCursor.ids should have length 4
+  }
+
+  test("Parquet (columnar) scan — taps fused at the ColumnarToRow boundary") {
+    val s = newSession(broadcast = true)
+    registerViews(s)
+    val pqDir = "/tmp/titian-test-sales-parquet"
+    s.conf.set("spark.titian.sql.capture", "false")
+    s.sql("SELECT * FROM sales").write.mode("overwrite").parquet(pqDir)
+    s.read.parquet(pqDir).createOrReplaceTempView("sales_pq")
+    s.conf.set("spark.titian.sql.capture", "true")
+
+    val df = s.sql(
+      "SELECT category, SUM(amount) AS total FROM sales_pq GROUP BY category")
+    val output = TitianSQL.collectWithLineage(df)
+    output.map(_._1).toSet should equal (Set(
+      Row("electronics", 101109L), Row("furniture", 865L),
+      Row("groceries", 355L), Row("toys", 280L)))
+
+    val electronicsId = output.find(_._1.getString(0) == "electronics").get._2
+    val cursor = TitianSQL.trace(df, Seq(electronicsId)).goBack()
+    cursor.atScan should be (true)
+    cursor.show().toSet should equal (Set(
+      Row("electronics", 420), Row("electronics", 310),
+      Row("electronics", 99999), Row("electronics", 380)))
+  }
+
+  test("full-row show — DISTINCT witnesses resolved to complete source records") {
+    val s = newSession(broadcast = true)
+    registerViews(s)
+    val df = s.sql("SELECT DISTINCT category FROM sales")
+    val output = TitianSQL.collectWithLineage(df)
+    val electronicsId = output.find(_._1.getString(0) == "electronics").get._2
+    val cursor = TitianSQL.trace(df, Seq(electronicsId)).goBack()
+
+    // pruned view: only the category column the query read
+    cursor.show().toSet should equal (Set(Row("electronics")))
+    // full view: the complete source rows, amounts included
+    cursor.show(full = true).toSet should equal (Set(
+      Row("electronics", 420), Row("electronics", 310),
+      Row("electronics", 99999), Row("electronics", 380)))
   }
 }
