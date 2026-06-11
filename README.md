@@ -136,10 +136,25 @@ Three end-to-end notebooks — [SQL](notebooks/titian_sql.ipynb),
 self-contained image (Spark 4.1.2, JDK 17, the Titian jar built from source):
 
 ```bash
+git clone https://github.com/SEED-VT/titian-spark-provenance.git
+cd titian-spark-provenance
 docker build -t titian -f docker/Dockerfile .
 docker run --rm -p 8888:8888 titian        # JupyterLab at http://localhost:8888
 docker run --rm titian validate            # execute all notebooks headlessly
 ```
+
+Without Docker (JDK 17+, sbt, Python >= 3.9):
+
+```bash
+sbt package                                # builds target/scala-2.13/titian_*.jar
+pip install pyspark==4.1.2 jupyterlab
+cd notebooks && jupyter lab
+```
+
+The bootstrap cell self-locates the jar, fastutil (coursier cache), the data, and
+spark-shell (pip pyspark); override with `TITIAN_HOME` / `TITIAN_JAR` /
+`FASTUTIL_JAR` / `SPARK_HOME` if your layout differs. Make sure `JAVA_HOME` points
+at JDK 17+.
 
 CI runs the full Scala suites, the PySpark end-to-end test, and the Docker notebook
 validation (see `.github/workflows/ci.yml`). The backlog lives in
