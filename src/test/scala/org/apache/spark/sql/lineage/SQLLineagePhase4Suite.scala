@@ -234,6 +234,16 @@ class SQLLineagePhase4Suite extends AnyFunSuite with BeforeAndAfterEach with Mat
       Row("electronics", 99999), Row("electronics", 380)))
   }
 
+  test("df.show() / LIMIT queries skip capture instead of failing") {
+    val s = newSession(broadcast = true)
+    registerViews(s)
+    // show() plans CollectLimit; must run untapped with capture on
+    s.sql("SELECT category, SUM(amount) FROM sales GROUP BY category").show(5)
+    val limited = s.sql("SELECT * FROM sales LIMIT 3")
+    limited.collect() should have length 3
+    assert(!limited.queryExecution.executedPlan.exists(_.isInstanceOf[TitianTapExec]))
+  }
+
   test("releaseLineage drops all capture blocks for a query") {
     val s = newSession(broadcast = true)
     registerViews(s)

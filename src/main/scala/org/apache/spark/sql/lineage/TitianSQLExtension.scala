@@ -80,6 +80,10 @@ case class InsertTitianTaps(session: SparkSession) extends Rule[SparkPlan] with 
     if (!captureEnabled) return plan
     // DDL / commands (CREATE VIEW, SHOW, writes-as-commands) are not data queries
     if (isCommand(plan)) return plan
+    // Display/limit queries (df.show(), LIMIT n) are not provenance targets: limits
+    // select rows positionally (control flow Titian does not capture), and show() is
+    // ubiquitous in notebooks — skip capture rather than fail.
+    if (isDisplayOnly(plan)) return plan
     // With AQE the outer preparation pipeline passes the AdaptiveSparkPlanExec wrapper
     // through this rule too; the real injection happens on the per-stage invocations
     // from inside AQE.
@@ -197,6 +201,13 @@ case class InsertTitianTaps(session: SparkSession) extends Rule[SparkPlan] with 
         logInfo(s"Titian SQL capture: result tap $tapId inserted")
         TapResultExec(tapId, root)
     }
+  }
+
+  private def isDisplayOnly(p: SparkPlan): Boolean = p.exists { node =>
+    node.isInstanceOf[org.apache.spark.sql.execution.CollectLimitExec] ||
+      node.isInstanceOf[org.apache.spark.sql.execution.TakeOrderedAndProjectExec] ||
+      node.getClass.getSimpleName.startsWith("GlobalLimit") ||
+      node.getClass.getSimpleName.startsWith("LocalLimit")
   }
 
   private def isCommand(p: SparkPlan): Boolean = p.exists { node =>

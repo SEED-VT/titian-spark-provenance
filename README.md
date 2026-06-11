@@ -1,5 +1,7 @@
 # Titian on Spark 4 — Record-Level Data Provenance for Apache Spark
 
+[![CI](https://github.com/SEED-VT/titian-spark-provenance/actions/workflows/ci.yml/badge.svg)](https://github.com/SEED-VT/titian-spark-provenance/actions/workflows/ci.yml)
+
 **Titian** provides *record-level* data provenance for Apache Spark: run a job with
 capture enabled, then interactively trace any output record **backward** to the exact
 input records that produced it — through shuffles, aggregations, and joins — and
@@ -125,6 +127,23 @@ end-to-end test is `python/tests/run.sh`.
 
 Runnable demos live in [`examples/`](examples/) (`SalesAnalysis`,
 `OrderCustomerJoin`, `CaptureOverheadBenchmark`).
+
+### Notebooks (reproducible via Docker)
+
+Three end-to-end notebooks — [SQL](notebooks/titian_sql.ipynb),
+[PySpark + Python UDFs](notebooks/titian_pyspark.ipynb), and the
+[RDD API](notebooks/titian_rdd.ipynb) — each with assertions, packaged in a
+self-contained image (Spark 4.1.2, JDK 17, the Titian jar built from source):
+
+```bash
+docker build -t titian -f docker/Dockerfile .
+docker run --rm -p 8888:8888 titian        # JupyterLab at http://localhost:8888
+docker run --rm titian validate            # execute all notebooks headlessly
+```
+
+CI runs the full Scala suites, the PySpark end-to-end test, and the Docker notebook
+validation (see `.github/workflows/ci.yml`). The backlog lives in
+[`ROADMAP.md`](ROADMAP.md).
 
 ### Deploying on a cluster
 
