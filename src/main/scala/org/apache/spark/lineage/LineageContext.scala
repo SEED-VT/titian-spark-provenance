@@ -327,6 +327,28 @@ class LineageContext(@transient val sparkContext: SparkContext) extends Logging 
 
   private[spark] var lastOperation: Option[Direction] = None
 
+  // Every tap RDD registers itself at construction so its materialized lineage
+  // blocks can be dropped later.
+  private val capturedTapIds = new mutable.ArrayBuffer[Int]
+
+  private[spark] def registerTap(rddId: Int): Unit = capturedTapIds += rddId
+
+  /**
+   * Drop the lineage blocks of every tap captured through this context so far
+   * (long sessions accumulate them in the executors' block managers).
+   */
+  def releaseLineage(): Unit = {
+    val ids = capturedTapIds.toSet
+    if (ids.nonEmpty) {
+      val master = sparkContext.env.blockManager.master
+      master.getMatchingBlockIds({
+        case org.apache.spark.storage.RDDBlockId(id, _) => ids.contains(id)
+        case _ => false
+      }, askStorageEndpoints = true).foreach(master.removeBlock)
+      capturedTapIds.clear()
+    }
+  }
+
   def isLineageActive: Boolean = captureLineage
 
   def setCaptureLineage(newLineage: Boolean) = {

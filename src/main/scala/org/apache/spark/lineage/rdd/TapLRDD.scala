@@ -41,6 +41,8 @@ class TapLRDD[T: ClassTag](@transient lc: LineageContext, @transient deps: Seq[D
 
   tapRDD = Some(this)
 
+  lc.registerTap(id)
+
   var isLast = false
 
   private[spark] var shuffledData: Lineage[_] = _

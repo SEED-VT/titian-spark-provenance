@@ -843,7 +843,7 @@ public class Int2RoaringBitMapOpenHashMap extends AbstractInt2ObjectMap<RoaringB
         maxFill = maxFill( n, f );
         mask = n - 1;
         final int key[] = this.key = new int[ n + 1 ];
-        final RoaringBitmap value[] = this.value = (RoaringBitmap[]) new Object[ n + 1 ];
+        final RoaringBitmap value[] = this.value = new RoaringBitmap[ n + 1 ];
         int k;
         RoaringBitmap v;
         for( int i = size, pos; i-- != 0; ) {

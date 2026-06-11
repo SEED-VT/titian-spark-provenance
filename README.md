@@ -34,8 +34,8 @@ crash-culprit isolation) are planned follow-on work on the same foundation.
   id, and lineage tables are joined with `zipPartitions` — never reshuffled (the
   distributed selective join of the VLDB paper, preserved and regression-tested).
 - **Spark SQL provenance via whole-stage codegen.** Tap operators implement
-  `CodegenSupport`, so per-record capture code is *fused into Spark's generated Java*.
-  Measured capture overhead for a SQL `GROUP BY` aggregate: **under 10%**.
+  `CodegenSupport`, so per-record capture code is *fused into Spark's generated Java*;
+  lineage is held as compact primitive-array blocks in the executors' block managers.
 - **Joins trace into both inputs** (`goBack(path = i)`), including broadcast hash joins
   with **exact** probe-row provenance; outer/semi/anti joins handled; `DISTINCT`
   returns all duplicate witnesses (control-flow dependencies); window functions at
@@ -195,14 +195,25 @@ key), exactly as in the paper; broadcast-join probe sides are exact.
 
 ## Performance (preliminary)
 
-2M rows, `local[2]`, median of 3 (`CaptureOverheadBenchmark`) — small-scale numbers,
-constants exaggerated; treat as directional until the at-scale benchmark lands:
+2M rows, `local[2]`, interleaved off/on pairs, median of 7
+(`CaptureOverheadBenchmark`) — small-scale numbers, constants exaggerated; treat as
+directional until the at-scale benchmark lands:
 
-| workload | capture off | capture on | overhead |
-|---|---|---|---|
-| SQL GROUP BY aggregate | 1.30 s | 1.43 s | **+9.8%** |
-| SQL join + aggregate | 2.01 s | 2.80 s | +39% |
-| RDD reduceByKey | 0.59 s | 0.92 s | +55% (optimization pass pending) |
+| metric | value |
+|---|---|
+| RDD reduceByKey capture overhead | ~10% |
+| SQL GROUP BY aggregate capture overhead | ~25–45% (laptop noise band) |
+| SQL join + aggregate capture overhead | ~45–60% (laptop noise band) |
+| backward trace, 1 result row (join + agg) | ~1.0 s |
+| lineage block footprint (join + agg) | 22.9 MB |
+
+The 2026-06 optimization pass (allocation-free capture, compact primitive-array
+lineage blocks, executor-side trace filtering with block-locality scheduling) cut the
+lineage footprint **4.3×** (99.2 → 22.9 MB) and trace latency **~1.5×** on this
+workload; capture wall-time overheads on a laptop are dominated by run-to-run noise.
+Lineage block storage is tunable with `spark.titian.lineage.storageLevel`
+(default `MEMORY_AND_DISK_SER`); inspect a query's footprint with
+`TitianSQL.lineageSize(df)`.
 
 ## Documentation
 

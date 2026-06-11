@@ -131,25 +131,41 @@ object LAggregator {
 
   import org.apache.spark.util.PackIntIntoLong
 
+  /**
+   * Mutable carrier for a combined value plus its lineage tag. A combiner lives in
+   * exactly one map slot, so merges can update `value` in place instead of allocating
+   * a fresh Tuple2 per record. Implements Product2 because everything downstream
+   * (reduce-side aggregation, trace machinery) reads tagged combiners through
+   * `Product2[C, Long]`.
+   */
+  private final class TaggedCombiner(var value: Any, val tag: Long)
+    extends Product2[Any, Long] with Serializable {
+    override def _1: Any = value
+    override def _2: Long = tag
+    override def canEqual(that: Any): Boolean = that.isInstanceOf[TaggedCombiner]
+  }
+
   // The casts are deliberate type-punning: in lineage mode the runtime objects flowing
   // through an RDD[(K, V)]-typed shuffle are (K, (V, Long)), as in the fork.
 
   private def wrapCreate[V, C](f: V => C): V => C = { (tagged: Any) =>
     val pair = tagged.asInstanceOf[Product2[V, Long]]
-    (f(pair._1), PackIntIntoLong(PackIntIntoLong.getLeft(pair._2), 0))
+    new TaggedCombiner(f(pair._1), PackIntIntoLong(PackIntIntoLong.getLeft(pair._2), 0))
   }.asInstanceOf[V => C]
 
   private def wrapMergeValue[V, C](f: (C, V) => C): (C, V) => C = {
     (combined: Any, tagged: Any) =>
-      val c = combined.asInstanceOf[Product2[C, Long]]
+      val c = combined.asInstanceOf[TaggedCombiner]
       val pair = tagged.asInstanceOf[Product2[V, Long]]
-      (f(c._1, pair._1), c._2)
+      c.value = f(c.value.asInstanceOf[C], pair._1)
+      c
   }.asInstanceOf[(C, V) => C]
 
   private def wrapMergeCombiners[C](f: (C, C) => C): (C, C) => C = {
     (left: Any, right: Any) =>
-      val a = left.asInstanceOf[Product2[C, Long]]
-      val b = right.asInstanceOf[Product2[C, Long]]
-      (f(a._1, b._1), a._2)
+      val a = left.asInstanceOf[TaggedCombiner]
+      val b = right.asInstanceOf[TaggedCombiner]
+      a.value = f(a.value.asInstanceOf[C], b.value.asInstanceOf[C])
+      a
   }.asInstanceOf[(C, C) => C]
 }

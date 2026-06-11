@@ -23,7 +23,7 @@ object CaptureOverheadBenchmark {
 
   def main(args: Array[String]): Unit = {
     val rows = if (args.nonEmpty) args(0).toInt else 2000000
-    val iterations = 3
+    val iterations = if (args.length > 1) args(1).toInt else 7
 
     val dataDir = new File(s"/tmp/titian-bench-${rows}")
     if (!dataDir.exists()) generate(dataDir, rows)
@@ -75,19 +75,26 @@ object CaptureOverheadBenchmark {
 
     def run(capture: Boolean): Long = {
       lc.setCaptureLineage(capture)
-      time {
+      val t = time {
         val pairs = lc.textFile(dataDir.getAbsolutePath, 8).map { line =>
           val c = line.indexOf(',')
           (line.substring(0, c), line.substring(c + 1).toInt)
         }
         pairs.reduceByKey(_ + _).collect()
       }
+      if (capture) {
+        // finalize capture (trace-DAG reconstruction) outside the timed region and
+        // drop the blocks so iterations don't fill the memory store
+        lc.setCaptureLineage(false)
+        lc.releaseLineage()
+      }
+      t
     }
 
-    run(capture = false) // warmup
-    val off = (1 to iterations).map(_ => run(capture = false))
-    val on = (1 to iterations).map(_ => run(capture = true))
-    report("RDD reduceByKey", off, on)
+    run(capture = false); run(capture = true) // warmup
+    // interleave off/on so JIT and page-cache warmup spread evenly over both
+    val pairs = (1 to iterations).map(_ => (run(capture = false), run(capture = true)))
+    report("RDD reduceByKey", pairs.map(_._1), pairs.map(_._2))
     sc.stop()
   }
 
@@ -110,9 +117,22 @@ object CaptureOverheadBenchmark {
     spark.read.schema("category STRING, owner STRING")
       .csv(s"$dataDir-dim").createOrReplaceTempView("dim")
 
+    import org.apache.spark.sql.lineage.TitianSQL
+
     def run(sql: String, capture: Boolean): Long = {
       spark.conf.set("spark.titian.sql.capture", capture.toString)
-      time { spark.sql(sql).collect() }
+      val df = spark.sql(sql)
+      val t = time { df.collect() }
+      // drop blocks so iterations don't fill the memory store
+      if (capture) TitianSQL.releaseLineage(df)
+      t
+    }
+
+    def bench(name: String, sql: String): Unit = {
+      run(sql, capture = false); run(sql, capture = true) // warmup
+      // interleave off/on so JIT and page-cache warmup spread evenly over both
+      val pairs = (1 to iterations).map(_ => (run(sql, capture = false), run(sql, capture = true)))
+      report(name, pairs.map(_._1), pairs.map(_._2))
     }
 
     val aggSql = "SELECT category, SUM(amount), COUNT(*) FROM sales GROUP BY category"
@@ -120,15 +140,23 @@ object CaptureOverheadBenchmark {
       """SELECT d.owner, SUM(s.amount) FROM sales s
         |JOIN dim d ON s.category = d.category GROUP BY d.owner""".stripMargin
 
-    run(aggSql, capture = false) // warmup
-    report("SQL groupBy aggregate",
-      (1 to iterations).map(_ => run(aggSql, capture = false)),
-      (1 to iterations).map(_ => run(aggSql, capture = true)))
+    bench("SQL groupBy aggregate", aggSql)
+    bench("SQL join + aggregate", joinSql)
 
-    run(joinSql, capture = false) // warmup
-    report("SQL join + aggregate",
-      (1 to iterations).map(_ => run(joinSql, capture = false)),
-      (1 to iterations).map(_ => run(joinSql, capture = true)))
+    // one captured run kept alive: trace latency and lineage footprint
+    {
+      spark.conf.set("spark.titian.sql.capture", "true")
+      val df = spark.sql(joinSql)
+      val rowsWithIds = TitianSQL.collectWithLineage(df)
+      val tTrace = time {
+        var c = TitianSQL.trace(df, Seq(rowsWithIds.head._2))
+        while (!c.atScan) c = c.goBack(0)
+      }
+      val (mem, disk) = TitianSQL.lineageSize(df)
+      println(f"SQL join backward trace (1 row): $tTrace%d ms   lineage blocks: " +
+        f"${mem / 1024.0 / 1024.0}%.1f MB mem, ${disk / 1024.0 / 1024.0}%.1f MB disk")
+      TitianSQL.releaseLineage(df)
+    }
 
     spark.stop()
   }

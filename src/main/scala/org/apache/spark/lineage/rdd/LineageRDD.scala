@@ -378,7 +378,10 @@ class LineageRDD(val prev: Lineage[(RecordId, Any)]) extends RDD[Any](prev) with
               case r2: (Int, Int)@unchecked => r2._2
             }), r._1._2), r._1._1) }, pre.getCachedData.map { r =>
               val hash = LineageHashing.hashKey(r._1)
-              ((r._2._2, hash), ((r._1, r._2._1), hash).toString())
+              // Combined cache replays carry LAggregator.TaggedCombiner values: read the
+              // (value, tag) pair through Product2, not Tuple2.
+              val tagged = r._2.asInstanceOf[Product2[Any, Long]]
+              ((tagged._2, hash), ((r._1, tagged._1), hash).toString())
             })).cache()
           // Following is a detailed version to set result
 

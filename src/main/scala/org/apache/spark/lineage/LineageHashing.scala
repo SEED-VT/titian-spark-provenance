@@ -17,21 +17,21 @@
 
 package org.apache.spark.lineage
 
-import java.nio.charset.StandardCharsets
-
-import com.google.common.hash.Hashing
+import org.apache.spark.unsafe.hash.Murmur3_x86_32
 
 /**
  * The single definition of the key hash used by lineage capture and tracing.
  *
- * The fork called `Hashing.murmur3_32().hashString(key.toString)` at every site (and
- * changed Spark's default `HashPartitioner` to match — see TOUCHPOINT_INVENTORY.md C3).
- * Only internal consistency matters: capture and trace must hash identically. Modern
- * Guava removed the charset-less overload and deprecated the unfixed variant, so the
- * algorithm is pinned here in one place.
+ * The fork hashed `key.toString` with murmur3 at every site — a per-record String
+ * allocation that dominated capture overhead. Only internal consistency matters
+ * (capture and trace must hash identically, and `LineageHashPartitioner` must route
+ * with the same function), so we hash the key's own `hashCode` through a murmur3
+ * finalizer instead: zero allocation, well-mixed bits for partition routing.
  */
 object LineageHashing {
 
-  def hashKey(key: Any): Int =
-    Hashing.murmur3_32_fixed().hashString(key.toString, StandardCharsets.UTF_8).asInt()
+  def hashKey(key: Any): Int = key match {
+    case null => 0
+    case k => Murmur3_x86_32.hashInt(k.hashCode(), 42)
+  }
 }
