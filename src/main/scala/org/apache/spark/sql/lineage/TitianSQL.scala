@@ -49,7 +49,8 @@ object TitianSQL {
   // ---------------------------------------------------------------- plan parsing
 
   sealed trait SourceInfo
-  case class ScanSource(scan: FileSourceScanExec) extends SourceInfo
+  /** Terminal level: a file scan or a cached relation (InMemoryTableScan). */
+  case class ScanSource(scan: SparkPlan) extends SourceInfo
   /**
    * A keyed capture level (post tap above an aggregate/join/window).
    * `hasProbe`: broadcast joins store (keyHash, exactProbeId) per output row; the
@@ -94,9 +95,13 @@ object TitianSQL {
 
   private def parseSource(plan: SparkPlan): SourceInfo = plan match {
     case t: TapScanExec =>
-      // CollapseCodegenStages may wrap the scan in an InputAdapter
-      ScanSource(t.child.collectFirst { case s: FileSourceScanExec => s }.getOrElse(
-        throw new IllegalStateException(s"No file scan under scan tap:\n$t")))
+      // CollapseCodegenStages may wrap the leaf in an InputAdapter/ColumnarToRow
+      ScanSource(t.child.collectFirst {
+        case s: FileSourceScanExec => s: SparkPlan
+        case m: org.apache.spark.sql.execution.columnar.InMemoryTableScanExec => m: SparkPlan
+        case c: org.apache.spark.sql.execution.adaptive.TableCacheQueryStageExec => c: SparkPlan
+      }.getOrElse(
+        throw new IllegalStateException(s"No source leaf under scan tap:\n$t")))
     case t: TapPostKeyedExec =>
       KeyedSource(t.tapId, hasProbe = false, directShuffles(t.child).map(parseBranch))
     case t: TapPostBroadcastJoinExec =>
@@ -223,25 +228,32 @@ object TitianSQL {
 
   private[lineage] def showScanRows(
       spark: SparkSession,
-      scan: FileSourceScanExec,
+      scan: SparkPlan,
       inputIds: Seq[Long],
-      full: Boolean = false): Array[Row] = {
+      full: Boolean = false): Array[Row] =
+    showScanRowsWithSchema(spark, scan, inputIds, full)._1
+
+  private[lineage] def showScanRowsWithSchema(
+      spark: SparkSession,
+      scan: SparkPlan,
+      inputIds: Seq[Long],
+      full: Boolean): (Array[Row], org.apache.spark.sql.types.StructType) = {
     // Full-source-row mode: re-execute the same scan (same FilePartitions, same
     // in-split row order) but with the complete data schema instead of the pruned
     // one. Only safe when nothing was pushed into the reader that could change the
     // emitted row set/order — otherwise fall back to the pruned view.
-    val effective =
-      if (full && scan.dataFilters.isEmpty &&
-          scan.relation.partitionSchema.isEmpty &&
-          scan.requiredSchema != scan.relation.dataSchema) {
-        val fullAttrs = scan.relation.dataSchema.fields.toSeq.map { f =>
+    val effective = scan match {
+      case fs: FileSourceScanExec
+        if full && fs.dataFilters.isEmpty &&
+           fs.relation.partitionSchema.isEmpty &&
+           fs.requiredSchema != fs.relation.dataSchema =>
+        val fullAttrs = fs.relation.dataSchema.fields.toSeq.map { f =>
           org.apache.spark.sql.catalyst.expressions.AttributeReference(
             f.name, f.dataType, f.nullable)()
         }
-        scan.copy(output = fullAttrs, requiredSchema = scan.relation.dataSchema)
-      } else {
-        scan
-      }
+        fs.copy(output = fullAttrs, requiredSchema = fs.relation.dataSchema)
+      case other => other
+    }
     val wanted = inputIds.toSet
     val matched = (if (effective.supportsColumnar) {
       // columnar scans emit ColumnarBatch; flatten in batch order — identical to the
@@ -274,7 +286,40 @@ object TitianSQL {
     val converter =
       org.apache.spark.sql.catalyst.CatalystTypeConverters
         .createToScalaConverter(effective.schema)
-    matched.map(r => converter(r).asInstanceOf[Row])
+    (matched.map(r => converter(r).asInstanceOf[Row]), effective.schema)
+  }
+
+  // ------------------------------------------------------- lifecycle & py4j API
+
+  /** Drop all lineage blocks captured for this query (long sessions accumulate). */
+  def releaseLineage(df: DataFrame): Unit = {
+    val graph = captureGraph(df)
+    def tapIds(s: SourceInfo): Seq[Int] = s match {
+      case _: ScanSource => Nil
+      case KeyedSource(id, _, branches) => id +: branches.flatMap {
+        case HashBranch(pre, up) => pre +: tapIds(up)
+        case DirectBranch(up) => tapIds(up)
+      }
+    }
+    val master = graph.spark.sparkContext.env.blockManager.master
+    (graph.resultTapId +: tapIds(graph.source)).foreach { tapId =>
+      master.getMatchingBlockIds({
+        case RDDBlockId(id, _) => id == tapId
+        case _ => false
+      }, askStorageEndpoints = true).foreach(master.removeBlock)
+    }
+  }
+
+  /** Py4J-friendly: packed lineage ids aligned with `df.collect()` row order. */
+  def resultIds(df: DataFrame): Array[Long] = {
+    val graph = captureGraph(df)
+    blocks[(Long, Long)](graph.spark, graph.resultTapId).sortBy(_._1).map(_._1)
+  }
+
+  /** Py4J-friendly trace entry point (accepts a Java list of numbers). */
+  def traceJava(df: DataFrame, outputIds: java.util.List[java.lang.Number]): TraceCursor = {
+    import scala.jdk.CollectionConverters._
+    trace(df, outputIds.asScala.map(_.longValue()).toSeq)
   }
 }
 
@@ -359,6 +404,17 @@ class TraceCursor private[lineage] (
    */
   def show(full: Boolean): Array[Row] = source match {
     case ScanSource(scan) => TitianSQL.showScanRows(spark, scan, ids.toSeq, full)
+    case _ => throw new UnsupportedOperationException(
+      "show() resolves source rows — goBack to a scan level first")
+  }
+
+  /** Py4J-friendly: source rows as JSON strings. */
+  def showJson(full: Boolean): Array[String] = source match {
+    case ScanSource(scan) =>
+      val (rows, schema) =
+        TitianSQL.showScanRowsWithSchema(spark, scan, ids.toSeq, full)
+      import scala.jdk.CollectionConverters._
+      spark.createDataFrame(rows.toSeq.asJava, schema).toJSON.collect()
     case _ => throw new UnsupportedOperationException(
       "show() resolves source rows — goBack to a scan level first")
   }

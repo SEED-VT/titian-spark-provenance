@@ -152,6 +152,54 @@ case class TapPostBroadcastJoinExec(tapId: Int, keyExprs: Seq[Expression], child
     copy(child = newChild)
 }
 
+/** Below a Python-UDF eval node: records the input-id sequence (1:1, buffered). */
+case class TapSeqExec(pairId: Int, child: SparkPlan) extends TitianTapExec {
+
+  override def doConsume(ctx: CodegenContext, input: Seq[ExprCode], row: ExprCode): String = {
+    val tap = ctx.addMutableState(
+      classOf[SeqTapRuntime].getName, "titianSeqTap",
+      v => s"$v = new ${classOf[SeqTapRuntime].getName}($pairId);")
+    s"""
+       |$tap.tap();
+       |${consume(ctx, input)}
+     """.stripMargin
+  }
+
+  override protected def doExecute(): RDD[InternalRow] = {
+    child.execute().mapPartitionsInternal { iter =>
+      val tap = new SeqTapRuntime(pairId)
+      iter.map { r => tap.tap(); r }
+    }
+  }
+
+  override protected def withNewChildInternal(newChild: SparkPlan): TapSeqExec =
+    copy(child = newChild)
+}
+
+/** Above the Python-UDF eval node: replays the recorded input-id sequence. */
+case class TapReseqExec(pairId: Int, child: SparkPlan) extends TitianTapExec {
+
+  override def doConsume(ctx: CodegenContext, input: Seq[ExprCode], row: ExprCode): String = {
+    val tap = ctx.addMutableState(
+      classOf[ReseqTapRuntime].getName, "titianReseqTap",
+      v => s"$v = new ${classOf[ReseqTapRuntime].getName}($pairId);")
+    s"""
+       |$tap.tap();
+       |${consume(ctx, input)}
+     """.stripMargin
+  }
+
+  override protected def doExecute(): RDD[InternalRow] = {
+    child.execute().mapPartitionsInternal { iter =>
+      val tap = new ReseqTapRuntime(pairId)
+      iter.map { r => tap.tap(); r }
+    }
+  }
+
+  override protected def withNewChildInternal(newChild: SparkPlan): TapReseqExec =
+    copy(child = newChild)
+}
+
 /**
  * Records (packed(partition, outputIdx) -> currentInputId) for every result row and
  * materializes the association at task end — `TapLRDD` (isLast) for SQL. Inserted at

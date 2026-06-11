@@ -25,10 +25,12 @@ import org.apache.spark.sql.catalyst.plans.{FullOuter, Inner, JoinType, LeftAnti
 import org.apache.spark.sql.catalyst.plans.physical.{HashPartitioning, SinglePartition}
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.execution.{ColumnarRule, ExpandExec, FileSourceScanExec, FilterExec, GenerateExec, ProjectExec, SortExec, SparkPlan, TitianJoinKeys}
-import org.apache.spark.sql.execution.adaptive.{AQEShuffleReadExec, BroadcastQueryStageExec, ShuffleQueryStageExec}
+import org.apache.spark.sql.execution.adaptive.{AQEShuffleReadExec, BroadcastQueryStageExec, ShuffleQueryStageExec, TableCacheQueryStageExec}
 import org.apache.spark.sql.execution.aggregate.HashAggregateExec
 import org.apache.spark.sql.execution.exchange.{BroadcastExchangeExec, Exchange, ShuffleExchangeExec}
+import org.apache.spark.sql.execution.columnar.InMemoryTableScanExec
 import org.apache.spark.sql.execution.joins.{BroadcastHashJoinExec, HashedRelationBroadcastMode, ShuffledHashJoinExec, SortMergeJoinExec}
+import org.apache.spark.sql.execution.python.{ArrowEvalPythonExec, BatchEvalPythonExec}
 import org.apache.spark.sql.execution.window.WindowExec
 
 /**
@@ -94,6 +96,22 @@ case class InsertTitianTaps(session: SparkSession) extends Rule[SparkPlan] with 
       // scan and this row-based tap — ids are assigned at the row boundary.
       case scan: FileSourceScanExec =>
         TapScanExec(scan)
+
+      // a cached DataFrame is a source boundary: trace stops at (and shows) the
+      // cached rows; provenance does not cross into the plan that built the cache.
+      // Under AQE the cache arrives wrapped in a TableCacheQueryStage leaf.
+      case imts: InMemoryTableScanExec =>
+        TapScanExec(imts)
+      case tc: TableCacheQueryStageExec =>
+        TapScanExec(tc)
+
+      // Python UDF eval is 1:1 and order-preserving but batched, which breaks
+      // currentInputId threading — record the id sequence below, replay it above
+      case py @ (_: BatchEvalPythonExec | _: ArrowEvalPythonExec)
+        if !py.children.head.isInstanceOf[TapSeqExec] =>
+        val pairId = session.sparkContext.newRddId()
+        TapReseqExec(pairId,
+          py.withNewChildren(Seq(TapSeqExec(pairId, py.children.head))))
 
       // map-side capture: below the partial aggregate when the exchange feeds one
       case ex: ShuffleExchangeExec => ex.child match {
@@ -232,6 +250,8 @@ case class InsertTitianTaps(session: SparkSession) extends Rule[SparkPlan] with 
     plan.foreach {
       case _: TitianTapExec => // ours
       case _: FileSourceScanExec => // row-based or columnar (ColumnarToRow boundary)
+      case _: InMemoryTableScanExec | _: TableCacheQueryStageExec => // cache: a source
+      case _: BatchEvalPythonExec | _: ArrowEvalPythonExec => // 1:1 Python UDF eval
       case _: FilterExec | _: ProjectExec => // pass-through
       case _: ExpandExec | _: GenerateExec => // 1->N within the pipeline: the
         // generated rows are consumed depth-first per input row, so currentInputId

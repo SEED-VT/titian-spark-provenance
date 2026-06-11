@@ -44,6 +44,13 @@ class LineageTaskState {
   /** Whether the current shuffle read is serving cached shuffle data (trace time). */
   var isShuffleCache: Boolean = false
 
+  /**
+   * Sequencing buffers for order-preserving-but-buffered operators (Python UDF
+   * eval): the tap below records the per-row input-id sequence under its pair id;
+   * the tap above replays it positionally.
+   */
+  val seqBuffers = new java.util.HashMap[Int, it.unimi.dsi.fastutil.ints.IntArrayList]()
+
   def getFromBufferPool(): Array[Byte] = LineageTaskState.getFromBufferPool()
 
   def getFromBufferPoolLarge(): Array[Byte] = LineageTaskState.getFromBufferPoolLarge()

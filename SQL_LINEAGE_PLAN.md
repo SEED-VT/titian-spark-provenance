@@ -102,11 +102,29 @@ Added and verified:
   reader (`dataFilters` empty, unpartitioned table); falls back to the pruned view
   otherwise.
 
-Phase 4 still remaining: Python UDF taps + PySpark wrapper (needs a pyspark test
-harness), DSv2 scans, cached relations (`InMemoryRelation`), writes as result taps,
-distributed trace joins (cursor collects to driver), block lifecycle (tap blocks not
-ContextCleaner-tracked), at-scale benchmark. All unsupported shapes fail loudly per
-caveat 4.
+## Status (2026-06-11): PySpark + Python UDFs + caches + lifecycle — 35/35 Scala + 7 PySpark e2e
+
+- **PySpark wrapper** (`python/titian.py`): `Titian(spark)` with `enable_capture`,
+  `collect_with_lineage`, `trace -> TraceCursor` (`go_back/go_next/ids/at_scan/show`),
+  `release_lineage`. Backed by py4j-friendly JVM entry points
+  (`resultIds`/`traceJava`/`showJson`). E2E test
+  (`python/tests/run.sh`, spark-submit + standalone Python 3.11 under `tools/`).
+- **Python UDFs traced exactly**: BatchEvalPython/ArrowEvalPython are 1:1 and
+  order-preserving but *batched*, which breaks currentInputId threading — `TapSeqExec`
+  below records the per-task input-id sequence, `TapReseqExec` above replays it
+  positionally. Verified end-to-end from PySpark (UDF + groupBy, witnesses exact).
+  Non-1:1 Python nodes (mapInPandas, UDTFs, grouped applies) still fail loudly.
+- **Cached DataFrames are source boundaries**: `df.cache()` plans
+  (`InMemoryTableScanExec`, AQE's `TableCacheQueryStageExec`) are tapped like scans —
+  traces stop at, and `show()` re-reads, the cached rows. Provenance does not cross
+  into the plan that built the cache (documented semantics, not a gap).
+- **Lineage lifecycle**: `TitianSQL.releaseLineage(df)` / Python `release_lineage`
+  drops every capture block of a query (long notebook sessions no longer accumulate
+  blocks unboundedly; per-query, explicit).
+
+Deliberately deferred as not-widely-used-enough for now: DSv2 scans (matters for
+Iceberg/Delta connectors), writes-as-result-taps, distributed trace joins, at-scale
+benchmark. All unsupported shapes fail loudly per caveat 4.
 
 ## Status (2026-06-10): Phases 0 and 1 DONE
 

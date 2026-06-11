@@ -123,6 +123,29 @@ class PostJoinTapRuntime(tapId: Int) {
 }
 
 /**
+ * Below a buffered 1:1 operator (Python UDF eval): records the per-row input-id
+ * sequence so the matching ReseqTap above can replay it positionally.
+ */
+class SeqTapRuntime(pairId: Int) {
+  private val state = LineageTaskState.get(TaskContext.get())
+  private val buf = new it.unimi.dsi.fastutil.ints.IntArrayList()
+  state.seqBuffers.put(pairId, buf)
+
+  def tap(): Unit = buf.add(state.currentInputId)
+}
+
+/** Above the buffered operator: restores currentInputId row by row. */
+class ReseqTapRuntime(pairId: Int) {
+  private val state = LineageTaskState.get(TaskContext.get())
+  private var i: Int = -1
+
+  def tap(): Unit = {
+    i += 1
+    state.currentInputId = state.seqBuffers.get(pairId).getInt(i)
+  }
+}
+
+/**
  * Result-side tap: records (packed(partition, outputIdx) -> currentInputId) per output
  * row and materializes the buffer to the BlockManager at task end (TapLRDD's role,
  * with LineageManager's materialization inlined into a completion listener).

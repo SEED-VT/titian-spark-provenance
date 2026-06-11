@@ -210,6 +210,46 @@ class SQLLineagePhase4Suite extends AnyFunSuite with BeforeAndAfterEach with Mat
       Row("electronics", 99999), Row("electronics", 380)))
   }
 
+  test("cached DataFrame — cache is a source boundary, witnesses are cached rows") {
+    val s = newSession(broadcast = true)
+    registerViews(s)
+    s.conf.set("spark.titian.sql.capture", "false")
+    val cached = s.sql("SELECT * FROM sales").cache()
+    cached.count() // materialize the cache without capture
+    cached.createOrReplaceTempView("sales_cached")
+    s.conf.set("spark.titian.sql.capture", "true")
+
+    val df = s.sql(
+      "SELECT category, SUM(amount) AS total FROM sales_cached GROUP BY category")
+    val output = TitianSQL.collectWithLineage(df)
+    output.map(_._1).toSet should equal (Set(
+      Row("electronics", 101109L), Row("furniture", 865L),
+      Row("groceries", 355L), Row("toys", 280L)))
+
+    val electronicsId = output.find(_._1.getString(0) == "electronics").get._2
+    val cursor = TitianSQL.trace(df, Seq(electronicsId)).goBack()
+    cursor.atScan should be (true)
+    cursor.show().toSet should equal (Set(
+      Row("electronics", 420), Row("electronics", 310),
+      Row("electronics", 99999), Row("electronics", 380)))
+  }
+
+  test("releaseLineage drops all capture blocks for a query") {
+    val s = newSession(broadcast = true)
+    registerViews(s)
+    val df = s.sql(
+      "SELECT category, SUM(amount) AS total FROM sales GROUP BY category")
+    val output = TitianSQL.collectWithLineage(df)
+    val electronicsId = output.find(_._1.getString(0) == "electronics").get._2
+    // trace works before release
+    TitianSQL.trace(df, Seq(electronicsId)).goBack().ids should have length 4
+
+    TitianSQL.releaseLineage(df)
+
+    // after release the capture blocks are gone: the same trace finds nothing
+    TitianSQL.trace(df, Seq(electronicsId)).ids shouldBe empty
+  }
+
   test("full-row show — DISTINCT witnesses resolved to complete source records") {
     val s = newSession(broadcast = true)
     registerViews(s)

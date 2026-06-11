@@ -98,6 +98,31 @@ val orders    = cursor.goBack(0).show()   // culprit rows in orders
 val customers = cursor.goBack(1).show()   // culprit rows in customers
 ```
 
+### PySpark
+
+```python
+# spark-submit --jars titian.jar,fastutil.jar \
+#   --conf spark.sql.extensions=org.apache.spark.sql.lineage.TitianSQLExtension \
+#   --py-files titian.py your_app.py
+from titian import Titian
+
+t = Titian(spark)
+t.enable_capture()
+
+df = spark.sql("SELECT category, SUM(amount) AS total FROM sales GROUP BY category")
+rows_with_ids = t.collect_with_lineage(df)
+
+bad_id = next(i for r, i in rows_with_ids if r.total > 100000)
+cursor = t.trace(df, [bad_id]).go_back()
+print(cursor.show(full=True))     # witness source records, as dicts
+t.release_lineage(df)             # drop this query's lineage blocks
+```
+
+Python UDFs are traced *exactly* (the eval nodes are 1:1; Titian re-threads record
+ids across their batching). Cached DataFrames (`df.cache()`) act as source
+boundaries: traces stop at, and `show()` re-reads, the cached rows. The PySpark
+end-to-end test is `python/tests/run.sh`.
+
 Runnable demos live in [`examples/`](examples/) (`SalesAnalysis`,
 `OrderCustomerJoin`, `CaptureOverheadBenchmark`).
 
@@ -124,8 +149,12 @@ avoid dynamic allocation during a capture/trace session (see caveats).
 | multi-hop (e.g. join → aggregate) backward & forward | ✅ | ✅ |
 | explode / count-distinct chains | n/a | ✅ |
 | window functions | n/a | ✅ (peer-set granularity) |
+| Python UDFs (batch/Arrow eval) | n/a | ✅ exact (id re-threading across batching) |
+| cached DataFrames (`df.cache()`) | n/a | ✅ as source boundaries |
+| Parquet/ORC (columnar) scans | n/a | ✅ ids at the ColumnarToRow boundary |
+| ROLLUP / CUBE / GROUPING SETS | n/a | ✅ visible-key granularity |
 | AQE on/off, whole-stage codegen on/off | n/a | ✅ both modes tested |
-| sortByKey, ROLLUP/CUBE, Python UDFs, DSv2/columnar scans | ported, unvalidated | ❌ fail loudly |
+| sortByKey, DSv2 scans, mapInPandas/UDTFs, writes | ported, unvalidated | ❌ fail loudly |
 
 Trace granularity across shuffles is **key-hash granularity** (all records sharing the
 key), exactly as in the paper; broadcast-join probe sides are exact.
