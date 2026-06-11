@@ -1,0 +1,15 @@
+reference/
+tools/
+target/
+project/target/
+project/project/
+.bsp/
+.bloop/
+.idea/
+*.log
+.claude/
+logs/
+work/
+metastore_db/
+derby.log
+spark-warehouse/

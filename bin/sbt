@@ -1,0 +1,6 @@
+#!/bin/sh
+# sbt wrapper pinned to the project-local JDK 17 and sbt distribution.
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+export JAVA_HOME="$ROOT/tools/jdk-17.0.19+10/Contents/Home"
+export PATH="$JAVA_HOME/bin:$PATH"
+exec "$ROOT/tools/sbt/bin/sbt" "$@"
