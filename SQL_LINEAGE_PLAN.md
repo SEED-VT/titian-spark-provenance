@@ -147,6 +147,68 @@ Implementation notes: tap runtime objects are plain classes (`ScanTapRuntime`,
 result-tap block ids come from `SparkContext.newRddId()` (unique vs. real RDDs; not
 ContextCleaner-tracked — TODO when block lifecycle management lands).
 
+
+## How taps are inserted (worked example)
+
+```sql
+SELECT c.name, SUM(o.amount) AS total
+FROM   orders o JOIN customers c ON o.cid = c.cid
+GROUP  BY c.name
+```
+
+```
+ STAGE 1 (map: orders)                      STAGE 2 (map: customers)
+ +-----------------------------+            +-----------------------------+
+ | FileScan orders             |            | FileScan customers          |
+ |   * TapScan                 |            |   * TapScan                 |
+ |     assigns rowId 0,1,2,... |            |     assigns rowId 0,1,2,... |
+ |     -> currentInputId       |            |     -> currentInputId       |
+ | Project cid, amount         |            | Project cid, name           |
+ |   * TapPreExchange(o.cid)   |            |   * TapPreExchange(c.cid)   |
+ |     hash(cid) -> {rowIds}   |            |     hash(cid) -> {rowIds}   |
+ | Exchange hashpart(o.cid)    |            | Exchange hashpart(c.cid)    |
+ +--------------+--------------+            +--------------+--------------+
+                |            shuffle                       |
+                v                                          v
+ STAGE 3 (join + partial aggregate)
+ +----------------------------------------------------------------------+
+ | ShuffleRead - Sort -+                                                 |
+ | ShuffleRead - Sort -+- SortMergeJoin (o.cid = c.cid)                  |
+ |   * TapPostKeyed(join keys)                                           |
+ |       packed(part, joinOutIdx) -> hash(cid)    <- bridges both inputs |
+ |       sets currentInputId = joinOutIdx                                |
+ |   * TapPreExchange(c.name)           <- below the partial aggregate!  |
+ |       hash(name) -> {joinOutIdxs}      (sees pre-combine rows)        |
+ | HashAggregate (partial SUM)                                           |
+ | Exchange hashpart(c.name)                                             |
+ +------------------------------+----------------------------------------+
+                                |  shuffle
+                                v
+ STAGE 4 (final aggregate = result stage)
+ +----------------------------------------------+
+ | ShuffleRead                                  |
+ | HashAggregate (final SUM)                    |
+ |   * TapPostKeyed(c.name)                     |
+ |       packed(part, outIdx) -> hash(name)     |
+ |       sets currentInputId = outIdx           |
+ |   * TapResult                                |
+ |       packed(part, resultIdx)                |
+ |                -> currentInputId             |
+ | collect()                                    |
+ +----------------------------------------------+
+
+ BACKWARD TRACE for ("Bob", 100644):
+   result id --TapResult--> outIdx --TapPostKeyed(stage4)--> hash("Bob")
+   --TapPreExchange(c.name)--> {joinOutIdxs} --TapPostKeyed(join)--> hash("c2")
+   --goBack(0): TapPreExchange(o.cid)--> orders rowIds {o2,o5,o8,o11}
+   --goBack(1): TapPreExchange(c.cid)--> customers rowId {c2,Bob}
+```
+
+Within a fused stage, identity rides the `currentInputId` thread (the codegen loop is
+depth-first per row); across every exchange it is re-established by hashing the
+partitioning/grouping/join key. Broadcast joins additionally store the exact probe
+rowId per output, so the streamed side traces to a single row.
+
 ## Phases
 
 ### Phase 0 — injection plumbing (small)
