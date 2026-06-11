@@ -14,3 +14,10 @@ metastore_db/
 derby.log
 spark-warehouse/
 __pycache__/
+
+# internal planning docs (kept locally, not published)
+MIGRATION_PLAN.md
+TOUCHPOINT_INVENTORY.md
+SQL_LINEAGE_PLAN.md
+ROADMAP.md
+CLAUDE.md

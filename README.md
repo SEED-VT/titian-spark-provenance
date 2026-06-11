@@ -157,8 +157,7 @@ spark-shell (pip pyspark); override with `TITIAN_HOME` / `TITIAN_JAR` /
 at JDK 17+.
 
 CI runs the full Scala suites, the PySpark end-to-end test, and the Docker notebook
-validation (see `.github/workflows/ci.yml`). The backlog lives in
-[`ROADMAP.md`](ROADMAP.md).
+validation (see `.github/workflows/ci.yml`).
 
 ### Deploying on a cluster
 
@@ -170,7 +169,8 @@ spark-submit \
 ```
 
 Everything else is `provided` by Spark. Lineage blocks live in executor BlockManagers:
-avoid dynamic allocation during a capture/trace session (see caveats).
+avoid dynamic allocation during a capture/trace session (see
+[`INSTALL.md`](INSTALL.md)).
 
 ## What's covered today
 
@@ -206,12 +206,19 @@ constants exaggerated; treat as directional until the at-scale benchmark lands:
 
 ## Documentation
 
-- [`MIGRATION_PLAN.md`](MIGRATION_PLAN.md) — strategy, status, and the full **caveats
-  and known limitations** (read before deploying).
-- [`TOUCHPOINT_INVENTORY.md`](TOUCHPOINT_INVENTORY.md) — every file the original fork
-  modified, mapped to its Spark 4 replacement mechanism.
-- [`SQL_LINEAGE_PLAN.md`](SQL_LINEAGE_PLAN.md) — the SQL provenance design, phase
-  status, and its twelve caveats.
+- [`INSTALL.md`](INSTALL.md) — build, test, cluster deployment, and notebook setup.
+
+### Known limitations (short version)
+
+- Trace granularity across shuffles is key-hash level (all records sharing the key);
+  broadcast-join probe sides are exact.
+- `show()` resolves traces by deterministic re-scan — valid while source files are
+  unchanged (file sources only; DSv2/Iceberg/Delta not yet supported).
+- Lineage lives in executor BlockManagers: avoid dynamic allocation during a
+  capture/trace session; release per-query lineage with `releaseLineage`.
+- Unsupported operators (e.g. `mapInPandas`, UDTFs, non-equi joins, writes) abort
+  capture loudly; display/`LIMIT` queries skip capture.
+- Validated on Spark 4.1.x; other versions untested.
 
 ## Development process
 
