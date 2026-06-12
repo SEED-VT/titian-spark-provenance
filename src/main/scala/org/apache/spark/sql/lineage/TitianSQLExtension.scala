@@ -24,7 +24,7 @@ import org.apache.spark.sql.catalyst.expressions.{Coalesce, Expression}
 import org.apache.spark.sql.catalyst.plans.{FullOuter, Inner, JoinType, LeftAnti, LeftOuter, LeftSemi, RightOuter}
 import org.apache.spark.sql.catalyst.plans.physical.{HashPartitioning, SinglePartition}
 import org.apache.spark.sql.catalyst.rules.Rule
-import org.apache.spark.sql.execution.{ColumnarRule, ExpandExec, FileSourceScanExec, FilterExec, GenerateExec, ProjectExec, SortExec, SparkPlan, TitianJoinKeys}
+import org.apache.spark.sql.execution.{ColumnarRule, ExpandExec, FileSourceScanExec, FilterExec, GenerateExec, ProjectExec, SortExec, SparkPlan, TakeOrderedAndProjectExec, TitianJoinKeys, UnionExec}
 import org.apache.spark.sql.execution.adaptive.{AQEShuffleReadExec, BroadcastQueryStageExec, ShuffleQueryStageExec, TableCacheQueryStageExec}
 import org.apache.spark.sql.execution.aggregate.HashAggregateExec
 import org.apache.spark.sql.execution.exchange.{BroadcastExchangeExec, Exchange, ShuffleExchangeExec}
@@ -80,9 +80,11 @@ case class InsertTitianTaps(session: SparkSession) extends Rule[SparkPlan] with 
     if (!captureEnabled) return plan
     // DDL / commands (CREATE VIEW, SHOW, writes-as-commands) are not data queries
     if (isCommand(plan)) return plan
-    // Display/limit queries (df.show(), LIMIT n) are not provenance targets: limits
-    // select rows positionally (control flow Titian does not capture), and show() is
-    // ubiquitous in notebooks — skip capture rather than fail.
+    // Display queries (df.show(), bare LIMIT n) are not provenance targets: positional
+    // row selection is control flow Titian does not capture, and show() is ubiquitous
+    // in notebooks — skip capture rather than fail. ORDER BY ... LIMIT
+    // (TakeOrderedAndProject) IS captured: it selects rows by sort key, which taps key
+    // on like any shuffle boundary.
     if (isDisplayOnly(plan)) return plan
     // With AQE the outer preparation pipeline passes the AdaptiveSparkPlanExec wrapper
     // through this rule too; the real injection happens on the per-stage invocations
@@ -120,6 +122,9 @@ case class InsertTitianTaps(session: SparkSession) extends Rule[SparkPlan] with 
       // map-side capture: below the partial aggregate when the exchange feeds one
       case ex: ShuffleExchangeExec => ex.child match {
         case agg: HashAggregateExec if !agg.child.isInstanceOf[TapPreExchangeExec] =>
+          if (!idSafeFromShuffle(agg.child)) {
+            throw new TitianUnsupportedOperatorException(ex)
+          }
           val pre = TapPreExchangeExec(
             session.sparkContext.newRddId(), visibleGroupKeys(agg.groupingExpressions),
             agg.child)
@@ -132,6 +137,9 @@ case class InsertTitianTaps(session: SparkSession) extends Rule[SparkPlan] with 
             case SinglePartition => Seq.empty
             case p => throw new TitianUnsupportedOperatorException(ex)
           }
+          if (!idSafeFromShuffle(other)) {
+            throw new TitianUnsupportedOperatorException(ex)
+          }
           ex.withNewChildren(
             Seq(TapPreExchangeExec(session.sparkContext.newRddId(), keys, other)))
       }
@@ -140,6 +148,9 @@ case class InsertTitianTaps(session: SparkSession) extends Rule[SparkPlan] with 
       case bex: BroadcastExchangeExec
         if !bex.child.isInstanceOf[TapPreExchangeExec] => bex.mode match {
         case HashedRelationBroadcastMode(keys, _) =>
+          if (!idSafeFromShuffle(bex.child)) {
+            throw new TitianUnsupportedOperatorException(bex)
+          }
           bex.withNewChildren(
             Seq(TapPreExchangeExec(session.sparkContext.newRddId(), keys, bex.child)))
         case _ => throw new TitianUnsupportedOperatorException(bex)
@@ -152,18 +163,29 @@ case class InsertTitianTaps(session: SparkSession) extends Rule[SparkPlan] with 
         if isReduceSide(agg.child) && !agg.isInstanceOf[TapPostKeyedExec] =>
         // The grouping values may surface in the output under an Alias (e.g.
         // GROUP BY upper(c) ... SELECT upper(c) AS x): resolve each grouping attr to
-        // the output attribute that carries its value.
-        val keyAttrs = visibleGroupKeys(agg.groupingExpressions)
-          .map(_.toAttribute).map { g =>
+        // the output attribute that carries its value. Grouping attrs pruned from the
+        // output (GROUP BY x, SELECT only aggregates) are appended to the aggregate's
+        // result expressions so the tap can key on them, and projected away above —
+        // the visible schema is unchanged.
+        val groupAttrs = visibleGroupKeys(agg.groupingExpressions).map(_.toAttribute)
+        val resolved = groupAttrs.map { g =>
           agg.resultExpressions.collectFirst {
             case ar: org.apache.spark.sql.catalyst.expressions.AttributeReference
-              if ar.exprId == g.exprId => ar
+              if ar.exprId == g.exprId => ar: Expression
             case al @ org.apache.spark.sql.catalyst.expressions.Alias(
               ar: org.apache.spark.sql.catalyst.expressions.AttributeReference, _)
-              if ar.exprId == g.exprId => al.toAttribute
-          }.getOrElse(throw new TitianUnsupportedOperatorException(agg))
+              if ar.exprId == g.exprId => al.toAttribute: Expression
+          }
         }
-        TapPostKeyedExec(session.sparkContext.newRddId(), keyAttrs, agg)
+        val keyAttrs = groupAttrs.zip(resolved).map { case (g, r) => r.getOrElse(g) }
+        val missing = groupAttrs.zip(resolved).collect { case (g, None) => g }
+        if (missing.isEmpty) {
+          TapPostKeyedExec(session.sparkContext.newRddId(), keyAttrs, agg)
+        } else {
+          val augmented = agg.copy(resultExpressions = agg.resultExpressions ++ missing)
+          ProjectExec(agg.output,
+            TapPostKeyedExec(session.sparkContext.newRddId(), keyAttrs, augmented))
+        }
 
       case j: SortMergeJoinExec =>
         TapPostKeyedExec(session.sparkContext.newRddId(),
@@ -176,18 +198,52 @@ case class InsertTitianTaps(session: SparkSession) extends Rule[SparkPlan] with 
       case j: BroadcastHashJoinExec =>
         // streamed keys, rewritten the same way as the broadcast mode's build keys,
         // so the output hash matches the build-side pre-broadcast tap
-        val streamedKeys =
-          if (j.buildSide == org.apache.spark.sql.catalyst.optimizer.BuildRight) {
-            j.leftKeys
-          } else {
-            j.rightKeys
-          }
+        val buildRight =
+          j.buildSide == org.apache.spark.sql.catalyst.optimizer.BuildRight
+        val streamedKeys = if (buildRight) j.leftKeys else j.rightKeys
+        // probe ids are recorded as exact row provenance: they must not arrive from
+        // an untapped shuffle (AQE's SMJ->BHJ conversion can produce this shape)
+        val streamedPlan = if (buildRight) j.left else j.right
+        if (!idSafeFromShuffle(streamedPlan)) {
+          throw new TitianUnsupportedOperatorException(j)
+        }
         TapPostBroadcastJoinExec(session.sparkContext.newRddId(),
           TitianJoinKeys.rewrite(streamedKeys), j)
 
       case w: WindowExec if isReduceSide(w.child) =>
         // window-partition (peer set) granularity: key outputs by the partition spec
         TapPostKeyedExec(session.sparkContext.newRddId(), w.partitionSpec, w)
+
+      // ORDER BY ... LIMIT selects rows by sort key: treat it exactly like a shuffle
+      // boundary — pre tap below keyed by the sort expressions, post tap above keyed
+      // by the same columns in the output (key-hash granularity; exact when the sort
+      // key is unique). Sort keys pruned by the projection (ORDER BY on an unselected
+      // column) are carried through the projection for the tap and stripped above.
+      // The operator's internal single-partition shuffle stays invisible.
+      case top: TakeOrderedAndProjectExec
+        if !top.child.isInstanceOf[TapPreExchangeExec] =>
+        val sortAttrs = topSortAttrs(top)
+        if (!idSafeFromShuffle(top.child)) {
+          throw new TitianUnsupportedOperatorException(top)
+        }
+        val resolved = sortAttrs.map { sa =>
+          top.projectList.collectFirst {
+            case a: org.apache.spark.sql.catalyst.expressions.AttributeReference
+              if a.exprId == sa.exprId => a: Expression
+            case al @ org.apache.spark.sql.catalyst.expressions.Alias(
+              a: org.apache.spark.sql.catalyst.expressions.AttributeReference, _)
+              if a.exprId == sa.exprId => al.toAttribute: Expression
+          }
+        }
+        val outKeys = sortAttrs.zip(resolved).map { case (sa, r) => r.getOrElse(sa) }
+        val missing = sortAttrs.zip(resolved).collect { case (sa, None) => sa }
+        val pre = TapPreExchangeExec(
+          session.sparkContext.newRddId(), sortAttrs, top.child)
+        val augmented = top.copy(projectList = top.projectList ++ missing)
+          .withNewChildren(Seq(pre))
+        val tapped =
+          TapPostKeyedExec(session.sparkContext.newRddId(), outKeys, augmented)
+        if (missing.isEmpty) tapped else ProjectExec(top.output, tapped)
     }
 
     // result tap: only on the final (non-exchange-rooted) stage, exactly once
@@ -197,6 +253,9 @@ case class InsertTitianTaps(session: SparkSession) extends Rule[SparkPlan] with 
       case _ if !tapped.exists(_.isInstanceOf[TapScanExec]) &&
                 !tapped.exists(_.isInstanceOf[TapPostKeyedExec]) => tapped
       case root =>
+        if (!idSafeFromShuffle(root)) {
+          throw new TitianUnsupportedOperatorException(root)
+        }
         val tapId = session.sparkContext.newRddId()
         logInfo(s"Titian SQL capture: result tap $tapId inserted")
         TapResultExec(tapId, root)
@@ -205,9 +264,38 @@ case class InsertTitianTaps(session: SparkSession) extends Rule[SparkPlan] with 
 
   private def isDisplayOnly(p: SparkPlan): Boolean = p.exists { node =>
     node.isInstanceOf[org.apache.spark.sql.execution.CollectLimitExec] ||
-      node.isInstanceOf[org.apache.spark.sql.execution.TakeOrderedAndProjectExec] ||
       node.getClass.getSimpleName.startsWith("GlobalLimit") ||
       node.getClass.getSimpleName.startsWith("LocalLimit")
+  }
+
+  /**
+   * The sort keys of an ORDER BY ... LIMIT as attributes of its child. Inline
+   * computed sort expressions (Catalyst normally pre-computes them below) are
+   * unsupported.
+   */
+  private def topSortAttrs(top: TakeOrderedAndProjectExec): Seq[
+      org.apache.spark.sql.catalyst.expressions.AttributeReference] =
+    top.sortOrder.map(_.child).map {
+      case ar: org.apache.spark.sql.catalyst.expressions.AttributeReference => ar
+      case _ => throw new TitianUnsupportedOperatorException(top)
+    }
+
+  /**
+   * Soundness guard: a tap that records `currentInputId` must not consume rows that
+   * crossed a shuffle without a keyed operator (whose post tap re-bases ids) in
+   * between — the ids would be stale leftovers from unrelated rows. Such shapes
+   * (e.g. a bare re-partition of shuffled rows) fail loudly.
+   */
+  private def idSafeFromShuffle(p: SparkPlan): Boolean = p match {
+    case _: ShuffleQueryStageExec | _: ShuffleExchangeExec | _: AQEShuffleReadExec =>
+      false
+    // keyed operators get a post tap (pass 2) that re-bases ids on their outputs
+    case _: HashAggregateExec | _: SortMergeJoinExec | _: ShuffledHashJoinExec |
+         _: BroadcastHashJoinExec | _: WindowExec |
+         _: TakeOrderedAndProjectExec => true
+    case _: TapPostKeyedExec | _: TapPostBroadcastJoinExec => true
+    case leaf if leaf.children.isEmpty => true
+    case other => other.children.forall(idSafeFromShuffle)
   }
 
   private def isCommand(p: SparkPlan): Boolean = p.exists { node =>
@@ -269,6 +357,12 @@ case class InsertTitianTaps(session: SparkSession) extends Rule[SparkPlan] with 
         // threading remains exact (rollup/cube/count-distinct, explode)
       case _: HashAggregateExec => // partial or final
       case _: WindowExec => // peer-set granularity via partition-spec keying
+      case _: UnionExec => // 1:1 concatenation; each task runs one child's partition,
+        // so per-task id threading holds — trace-side partition translation only
+      case top: TakeOrderedAndProjectExec =>
+        topSortAttrs(top) // throws if a sort key is computed inline
+      case _: org.apache.spark.sql.execution.EmptyRelationExec => // AQE's
+        // empty-relation propagation: a zero-row leaf, trivially a source
       case ex: ShuffleExchangeExec => ex.outputPartitioning match {
         case _: HashPartitioning | SinglePartition => // supported
         case _ => throw new TitianUnsupportedOperatorException(ex)

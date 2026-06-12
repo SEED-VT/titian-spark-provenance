@@ -187,11 +187,41 @@ avoid dynamic allocation during a capture/trace session (see
 | cached DataFrames (`df.cache()`) | n/a | ✅ as source boundaries |
 | Parquet/ORC (columnar) scans | n/a | ✅ ids at the ColumnarToRow boundary |
 | ROLLUP / CUBE / GROUPING SETS | n/a | ✅ visible-key granularity |
+| `UNION ALL` — branches via `goBack(path)` | ported, unvalidated | ✅ exact (no tap needed; partition-routed) |
+| `ORDER BY ... LIMIT` (TakeOrderedAndProject) | n/a | ✅ sort-key granularity (exact when keys unique) |
 | AQE on/off, whole-stage codegen on/off | n/a | ✅ both modes tested |
 | sortByKey, DSv2 scans, mapInPandas/UDTFs, writes | ported, unvalidated | ❌ fail loudly |
 
 Trace granularity across shuffles is **key-hash granularity** (all records sharing the
-key), exactly as in the paper; broadcast-join probe sides are exact.
+key), exactly as in the paper; broadcast-join probe sides are exact. Bare `LIMIT` /
+`df.show()` (positional selection, no sort key) still skips capture.
+
+### TPC-DS coverage
+
+A coverage harness runs every TPC-DS v1.4 query (the 103 files Apache Spark ships in
+its own test suite) against Titian: capture off vs on must produce identical answers,
+then one result row is traced backward to source rows. See
+[`tpcds/`](tpcds/) and the scoreboard in `TPCDSCoverage`:
+
+```bash
+pip install duckdb && python3 tpcds/gen_data.py 0.2   # parquet via DuckDB's dsdgen
+sbt 'examples/runMain edu.vt.bigdebug.examples.TPCDSCoverage'
+```
+
+Current scoreboard (sf=0.2, Spark 4.1.2, AQE on):
+
+| outcome | queries |
+|---|---|
+| **PASS** — identical answers + 1-row backward trace to source rows | **59 / 103** |
+| UNSUPPORTED — capture aborts loudly on an out-of-scope operator | 43 |
+| ERROR — q90 only: `DIVIDE_BY_ZERO` in the *baseline* at this tiny scale factor | 1 |
+
+The unsupported buckets, by blocking operator: shuffle/broadcast capture fed by an
+untapped shuffle (34 — Titian's soundness guard refuses to record stale row ids;
+needs mid-pipeline re-keying — plus a few range-partitioned global sorts),
+`WindowGroupLimitExec` (3, `rank() <= n` pushdown), existence-join BHJ (3),
+inline-computed sort keys (2), global sort without LIMIT (1). All of these fail
+loudly — never silent wrong lineage.
 
 ## Performance (preliminary)
 

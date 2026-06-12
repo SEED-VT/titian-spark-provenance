@@ -50,14 +50,26 @@ object TitianSQL {
   // ---------------------------------------------------------------- plan parsing
 
   sealed trait SourceInfo
-  /** Terminal level: a file scan or a cached relation (InMemoryTableScan). */
-  case class ScanSource(scan: SparkPlan) extends SourceInfo
   /**
-   * A keyed capture level (post tap above an aggregate/join/window).
+   * Terminal level: a file scan or a cached relation (InMemoryTableScan).
+   * `partOffset`: when the scan runs inside a union's stage, recorded partition ids
+   * are stage-wide (scan partition + offset of this child within the union); the
+   * re-scan translates back.
+   */
+  case class ScanSource(scan: SparkPlan, partOffset: Int = 0) extends SourceInfo
+  /**
+   * A keyed capture level (post tap above an aggregate/join/window/order-by-limit).
    * `hasProbe`: broadcast joins store (keyHash, exactProbeId) per output row; the
    * probe branch is then a [[DirectBranch]] with exact row provenance.
    */
   case class KeyedSource(tapId: Int, hasProbe: Boolean, branches: Seq[BranchLink])
+    extends SourceInfo
+  /**
+   * UNION ALL: 1:1 concatenation — no tap of its own. Each output row keeps the id its
+   * child pipeline assigned; child i owns the stage partitions
+   * [starts(i), starts(i) + counts(i)). goBack(i) filters ids to that range.
+   */
+  case class UnionSource(children: Seq[SourceInfo], starts: Seq[Int], counts: Seq[Int])
     extends SourceInfo
 
   sealed trait BranchLink { def upstream: SourceInfo }
@@ -94,7 +106,7 @@ object TitianSQL {
     CaptureGraph(df.sparkSession, result.tapId, parseSource(result.child))
   }
 
-  private def parseSource(plan: SparkPlan): SourceInfo = plan match {
+  private def parseSource(plan: SparkPlan, partOffset: Int = 0): SourceInfo = plan match {
     case t: TapScanExec =>
       // CollapseCodegenStages may wrap the leaf in an InputAdapter/ColumnarToRow
       ScanSource(t.child.collectFirst {
@@ -102,9 +114,18 @@ object TitianSQL {
         case m: org.apache.spark.sql.execution.columnar.InMemoryTableScanExec => m: SparkPlan
         case c: org.apache.spark.sql.execution.adaptive.TableCacheQueryStageExec => c: SparkPlan
       }.getOrElse(
-        throw new IllegalStateException(s"No source leaf under scan tap:\n$t")))
-    case t: TapPostKeyedExec =>
-      KeyedSource(t.tapId, hasProbe = false, directShuffles(t.child).map(parseBranch))
+        throw new IllegalStateException(s"No source leaf under scan tap:\n$t")), partOffset)
+    case t: TapPostKeyedExec => topBelow(t.child) match {
+      // ORDER BY ... LIMIT: a single branch through the tap pair around it. Its
+      // internal shuffle is invisible in the tree, so directShuffles cannot find it.
+      case Some(top) =>
+        val pre = firstPreTap(top.child).getOrElse(
+          throw new IllegalStateException(s"No pre tap under order-by-limit:\n$top"))
+        KeyedSource(t.tapId, hasProbe = false,
+          Seq(HashBranch(pre.tapId, parseSource(pre.child))))
+      case None =>
+        KeyedSource(t.tapId, hasProbe = false, directShuffles(t.child).map(parseBranch))
+    }
     case t: TapPostBroadcastJoinExec =>
       val bhj = t.child.asInstanceOf[
         org.apache.spark.sql.execution.joins.BroadcastHashJoinExec]
@@ -113,12 +134,24 @@ object TitianSQL {
       val (buildPlan, probePlan) =
         if (buildOnLeft) (bhj.left, bhj.right) else (bhj.right, bhj.left)
       val buildBranch = parseBroadcastBranch(buildPlan)
-      val probeBranch = DirectBranch(parseSource(probePlan))
+      // probe side shares this pipeline's tasks: the union offset (if any) carries over
+      val probeBranch = DirectBranch(parseSource(probePlan, partOffset))
       // branch indices follow logical join inputs: 0 = left, 1 = right
       val branches =
         if (buildOnLeft) Seq(buildBranch, probeBranch) else Seq(probeBranch, buildBranch)
       KeyedSource(t.tapId, hasProbe = true, branches)
-    case u: UnaryExecNode => parseSource(u.child)
+    case e: org.apache.spark.sql.execution.EmptyRelationExec =>
+      // AQE replaced an empty subtree: a zero-row source; no ids can reach it and a
+      // re-scan trivially yields nothing
+      ScanSource(e, partOffset)
+    case u: org.apache.spark.sql.execution.UnionExec =>
+      // no tap: rows keep their child-pipeline ids; child i's rows live in stage
+      // partitions offset by the partition counts of the children before it
+      val counts = u.children.map(_.execute().getNumPartitions)
+      val starts = counts.scanLeft(partOffset)(_ + _).init
+      UnionSource(
+        u.children.zip(starts).map { case (c, o) => parseSource(c, o) }, starts, counts)
+    case u: UnaryExecNode => parseSource(u.child, partOffset)
     case other =>
       throw new IllegalStateException(
         s"Cannot parse capture graph at ${other.getClass.getSimpleName}:\n$other")
@@ -165,6 +198,17 @@ object TitianSQL {
     HashBranch(pre.tapId, parseSource(pre.child))
   }
 
+  /**
+   * The TakeOrderedAndProject a post tap was inserted directly above, looking through
+   * the InputAdapter that CollapseCodegenStages places at the codegen boundary.
+   */
+  private def topBelow(p: SparkPlan): Option[
+      org.apache.spark.sql.execution.TakeOrderedAndProjectExec] = p match {
+    case top: org.apache.spark.sql.execution.TakeOrderedAndProjectExec => Some(top)
+    case ia: org.apache.spark.sql.execution.InputAdapter => topBelow(ia.child)
+    case _ => None
+  }
+
   private def firstPreTap(p: SparkPlan): Option[TapPreExchangeExec] = p match {
     case t: TapPreExchangeExec => Some(t)
     case _: ShuffleQueryStageExec | _: ShuffleExchangeExec => None
@@ -205,6 +249,10 @@ object TitianSQL {
   /** Collect result rows paired with their packed output lineage ids. */
   def collectWithLineage(df: DataFrame): Array[(Row, Long)] = {
     val rows = df.collect() // triggers execution and capture
+    // a query AQE collapsed to an empty relation carries no taps — and no rows
+    if (rows.isEmpty && !finalPlan(df).exists(_.isInstanceOf[TapResultExec])) {
+      return Array.empty
+    }
     val graph = captureGraph(df)
     val associations = resultAssociations(graph.spark, graph.resultTapId)
     require(rows.length == associations.length,
@@ -238,22 +286,26 @@ object TitianSQL {
     def findScan(s: SourceInfo): ScanSource = s match {
       case sc: ScanSource => sc
       case KeyedSource(_, _, branches) => findScan(branches.head.upstream)
+      case UnionSource(children, _, _) => findScan(children.head)
     }
-    showScanRows(graph.spark, findScan(graph.source).scan, inputIds)
+    val scan = findScan(graph.source)
+    showScanRows(graph.spark, scan.scan, inputIds, full = false, scan.partOffset)
   }
 
   private[lineage] def showScanRows(
       spark: SparkSession,
       scan: SparkPlan,
       inputIds: Seq[Long],
-      full: Boolean = false): Array[Row] =
-    showScanRowsWithSchema(spark, scan, inputIds, full)._1
+      full: Boolean = false,
+      partOffset: Int = 0): Array[Row] =
+    showScanRowsWithSchema(spark, scan, inputIds, full, partOffset)._1
 
   private[lineage] def showScanRowsWithSchema(
       spark: SparkSession,
       scan: SparkPlan,
       inputIds: Seq[Long],
-      full: Boolean): (Array[Row], org.apache.spark.sql.types.StructType) = {
+      full: Boolean,
+      partOffset: Int = 0): (Array[Row], org.apache.spark.sql.types.StructType) = {
     // Full-source-row mode: re-execute the same scan (same FilePartitions, same
     // in-split row order) but with the complete data schema instead of the pruned
     // one. Only safe when nothing was pushed into the reader that could change the
@@ -271,11 +323,14 @@ object TitianSQL {
       case other => other
     }
     val wanted = inputIds.toSet
+    // ids were recorded with stage-wide partition numbers; this re-scan's tasks are
+    // scan-local — shift by the scan's offset within its stage (non-zero under unions)
+    val offset = partOffset
     val matched = (if (effective.supportsColumnar) {
       // columnar scans emit ColumnarBatch; flatten in batch order — identical to the
       // row order ColumnarToRow produced at capture time
       effective.executeColumnar().mapPartitionsInternal { batches =>
-        val split = TaskContext.getPartitionId()
+        val split = TaskContext.getPartitionId() + offset
         var idx = -1
         batches.flatMap { batch =>
           scala.jdk.CollectionConverters.IteratorHasAsScala(batch.rowIterator())
@@ -289,7 +344,7 @@ object TitianSQL {
       }
     } else {
       effective.execute().mapPartitionsInternal { iter =>
-        val split = TaskContext.getPartitionId()
+        val split = TaskContext.getPartitionId() + offset
         var idx = -1
         iter.flatMap { row =>
           idx += 1
@@ -310,6 +365,7 @@ object TitianSQL {
   private def allTapIds(graph: CaptureGraph): Seq[Int] = {
     def tapIds(s: SourceInfo): Seq[Int] = s match {
       case _: ScanSource => Nil
+      case UnionSource(children, _, _) => children.flatMap(tapIds)
       case KeyedSource(id, _, branches) => id +: branches.flatMap {
         case HashBranch(pre, up) => pre +: tapIds(up)
         case DirectBranch(up) => tapIds(up)
@@ -330,6 +386,9 @@ object TitianSQL {
 
   /** Drop all lineage blocks captured for this query (long sessions accumulate). */
   def releaseLineage(df: DataFrame): Unit = {
+    // a query AQE collapsed to an empty relation carries no result tap (and the
+    // reachable capture graph with it); nothing to release
+    if (!finalPlan(df).exists(_.isInstanceOf[TapResultExec])) return
     val graph = captureGraph(df)
     val master = graph.spark.sparkContext.env.blockManager.master
     allBlockIds(graph).foreach(master.removeBlock)
@@ -337,6 +396,7 @@ object TitianSQL {
 
   /** (memoryBytes, diskBytes) currently held by this query's lineage blocks. */
   def lineageSize(df: DataFrame): (Long, Long) = {
+    if (!finalPlan(df).exists(_.isInstanceOf[TapResultExec])) return (0L, 0L)
     val graph = captureGraph(df)
     val master = graph.spark.sparkContext.env.blockManager.master
     allBlockIds(graph).foldLeft((0L, 0L)) { case ((mem, disk), bid) =>
@@ -411,10 +471,17 @@ class TraceCursor private[lineage] (
       }.collect()
     }
 
-  /** One step backward; `branch` selects the join input at a multi-input level. */
+  /** One step backward; `branch` selects the join/union input at a multi-input level. */
   def goBack(branch: Int = 0): TraceCursor = source match {
-    case ScanSource(_) =>
+    case ScanSource(_, _) =>
       throw new UnsupportedOperationException("already at the source level")
+    case UnionSource(children, starts, counts) =>
+      // 1:1 — ids pass through unchanged; the branch owns a stage-partition range
+      val (start, end) = (starts(branch), starts(branch) + counts(branch))
+      val nextIds = ids.filter { id =>
+        val p = PackIntIntoLong.getLeft(id); p >= start && p < end
+      }
+      new TraceCursor(spark, children(branch), nextIds, (source, ids, branch) :: path)
     case ks @ KeyedSource(tapId, _, branches) =>
       val idSet = ids.toSet
       val nextIds = branches(branch) match {
@@ -444,6 +511,9 @@ class TraceCursor private[lineage] (
   /** One step forward, retracing the branch taken by the last goBack. */
   def goNext(): TraceCursor = path match {
     case Nil => throw new UnsupportedOperationException("already at the result level")
+    case (parent: UnionSource, _, _) :: rest =>
+      // 1:1 with shared coordinates: the current ids are already union-level ids
+      new TraceCursor(spark, parent, ids, rest)
     case (parent: KeyedSource, _, branch) :: rest =>
       val idSet = ids.toSet
       val parentIds = parent.branches(branch) match {
@@ -478,16 +548,17 @@ class TraceCursor private[lineage] (
    * columns) instead of the query's pruned view, when the scan shape allows it.
    */
   def show(full: Boolean): Array[Row] = source match {
-    case ScanSource(scan) => TitianSQL.showScanRows(spark, scan, ids.toSeq, full)
+    case ScanSource(scan, off) =>
+      TitianSQL.showScanRows(spark, scan, ids.toSeq, full, off)
     case _ => throw new UnsupportedOperationException(
       "show() resolves source rows — goBack to a scan level first")
   }
 
   /** Py4J-friendly: source rows as JSON strings. */
   def showJson(full: Boolean): Array[String] = source match {
-    case ScanSource(scan) =>
+    case ScanSource(scan, off) =>
       val (rows, schema) =
-        TitianSQL.showScanRowsWithSchema(spark, scan, ids.toSeq, full)
+        TitianSQL.showScanRowsWithSchema(spark, scan, ids.toSeq, full, off)
       import scala.jdk.CollectionConverters._
       spark.createDataFrame(rows.toSeq.asJava, schema).toJSON.collect()
     case _ => throw new UnsupportedOperationException(

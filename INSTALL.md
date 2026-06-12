@@ -79,6 +79,19 @@ The notebooks' bootstrap cell self-locates the jar, fastutil, data, and spark-sh
 override with `TITIAN_HOME` / `TITIAN_JAR` / `FASTUTIL_JAR` / `SPARK_HOME` if needed.
 Make sure `JAVA_HOME` points at JDK 17+.
 
+## TPC-DS coverage harness
+
+```bash
+pip install duckdb
+python3 tpcds/gen_data.py 0.2          # ~200 MB of Parquet under tpcds/data/sf0.2
+sbt 'examples/runMain edu.vt.bigdebug.examples.TPCDSCoverage'
+# or a subset / other data dir:
+sbt 'examples/runMain edu.vt.bigdebug.examples.TPCDSCoverage <dataDir> <queryDir> q3,q7'
+```
+
+Per query it checks capture-on answers against capture-off, traces one result row
+back to a scan, and prints a PASS / UNSUPPORTED / ERROR scoreboard.
+
 ## Cluster deployment notes
 
 - Ship exactly two jars (`titian.jar`, `fastutil.jar`); everything else comes from
