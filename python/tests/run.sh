@@ -16,9 +16,14 @@ SPARK_HOME="${SPARK_HOME:-$ROOT/tools/spark-4.1.2-bin-hadoop3}"
 TITIAN_JAR="$ROOT/target/scala-2.13/titian_2.13-4.0.0-SNAPSHOT.jar"
 FASTUTIL_JAR="$(find ~/Library/Caches/Coursier ~/.cache/coursier -name 'fastutil-8.5.15.jar' 2>/dev/null | head -1)"
 
-exec "$SPARK_HOME/bin/spark-submit" \
-  --master 'local[2]' \
-  --jars "$TITIAN_JAR,$FASTUTIL_JAR" \
-  --conf spark.sql.extensions=org.apache.spark.sql.lineage.TitianSQLExtension \
-  --py-files "$ROOT/python/titian.py" \
-  "$ROOT/python/tests/test_titian_pyspark.py"
+submit() {
+  "$SPARK_HOME/bin/spark-submit" \
+    --master 'local[2]' \
+    --jars "$TITIAN_JAR,$FASTUTIL_JAR" \
+    --conf spark.sql.extensions=org.apache.spark.sql.lineage.TitianSQLExtension \
+    --py-files "$ROOT/python/titian.py,$ROOT/python/bigsift.py" \
+    "$1"
+}
+
+submit "$ROOT/python/tests/test_titian_pyspark.py"
+submit "$ROOT/python/tests/test_bigsift_pyspark.py"

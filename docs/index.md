@@ -22,6 +22,8 @@ DataFrame** provenance that did not exist in the original.
 <div class="grid cards" markdown>
 
 - :material-rocket-launch: **[Usage](usage.md)** — SQL, RDD, and PySpark quick starts.
+- :material-bug-check: **[BigSift](bigsift.md)** — automated isolation of the minimal
+  fault-inducing input records (provenance + delta debugging).
 - :material-cog: **[Getting started](install.md)** — build, test, deploy, notebooks.
 - :material-book-open-variant: **[Command & flag reference](reference.md)** — every
   task, script, config flag, and env var.

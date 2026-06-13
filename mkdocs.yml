@@ -37,6 +37,7 @@ theme:
 nav:
   - Home: index.md
   - Usage: usage.md
+  - BigSift (automated debugging): bigsift.md
   - Getting started: install.md
   - Command & flag reference: reference.md
   - TPC-DS coverage: tpcds.md
