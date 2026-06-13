@@ -261,7 +261,12 @@ to produce byte-identical lineage (full suite green under each flag). See
 
 ## Documentation
 
+- **API reference (Scaladoc)** — `sbt doc` → `target/scala-2.13/api/index.html`. Full
+  code/usage/optimization reference: usage overview, per-package guides, the public
+  trace API grouped by task, and the capture-engine internals. CI uploads it as the
+  `scaladoc-api` artifact on every run.
 - [`INSTALL.md`](INSTALL.md) — build, test, cluster deployment, and notebook setup.
+- [`ABLATION.md`](ABLATION.md) — the `spark.titian.ablation` tuning flags and study.
 
 ### Known limitations (short version)
 

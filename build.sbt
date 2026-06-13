@@ -38,6 +38,19 @@ lazy val titian = (project in file("."))
     ),
     scalacOptions ++= Seq("-deprecation", "-unchecked"),
     javacOptions ++= Seq("--release", "17"),
+    // Scaladoc: `sbt doc` -> target/scala-2.13/api/index.html. The root page
+    // (src/main/rootdoc.txt) is the API/usage/optimization overview; -groups renders
+    // the @group tags on the public API entry points.
+    Compile / doc / scalacOptions ++= Seq(
+      "-doc-title", "Titian — record-level data provenance for Spark 4",
+      "-doc-version", version.value,
+      "-doc-root-content", ((Compile / scalaSource).value / "rootdoc.txt").getAbsolutePath,
+      "-groups",
+      // document internals too (private[spark] capture engine, tap operators, the
+      // optimization flags) — the docs are meant to fully explain the code
+      "-private",
+      "-no-link-warnings"
+    ),
     Test / fork := true,
     Test / javaOptions ++= sparkJavaOptions,
     // local-cluster tests: the Worker launches executor JVMs via Spark's launcher,

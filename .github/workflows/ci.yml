@@ -55,6 +55,31 @@ jobs:
           PYSPARK_PYTHON: python
         run: sh python/tests/run.sh
 
+  docs:
+    name: Scaladoc API HTML
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: sbt/setup-sbt@v1
+      - name: Cache coursier
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/coursier
+          key: coursier-${{ hashFiles('build.sbt', 'project/build.properties') }}
+      - name: Generate Scaladoc
+        run: sbt -batch doc
+      - name: Upload API docs
+        uses: actions/upload-artifact@v4
+        with:
+          name: scaladoc-api
+          path: target/scala-2.13/api
+      # To host these at a public URL, enable GitHub Pages (Settings > Pages >
+      # Source: GitHub Actions) and add a deploy-pages step.
+
   docker-notebooks:
     name: Docker image + notebook validation
     runs-on: ubuntu-latest

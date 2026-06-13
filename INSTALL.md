@@ -79,6 +79,18 @@ The notebooks' bootstrap cell self-locates the jar, fastutil, data, and spark-sh
 override with `TITIAN_HOME` / `TITIAN_JAR` / `FASTUTIL_JAR` / `SPARK_HOME` if needed.
 Make sure `JAVA_HOME` points at JDK 17+.
 
+## API documentation (Scaladoc)
+
+```bash
+sbt doc        # -> target/scala-2.13/api/index.html
+```
+
+The generated HTML is the full API/code/optimization reference: a usage overview on
+the landing page, per-package guides (RDD `org.apache.spark.lineage`, SQL
+`org.apache.spark.sql.lineage`), the public trace API grouped by task, and the
+capture-engine internals (tap operators, runtimes, block formats). CI also builds it
+and uploads a `scaladoc-api` artifact on every run.
+
 ## TPC-DS coverage harness
 
 ```bash

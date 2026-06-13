@@ -1,0 +1,67 @@
+=Titian: record-level data provenance for Apache Spark 4=
+
+Titian (PVLDB '16) attaches to '''stock Spark 4.1.x''' as a library — no forked
+Spark — and captures fine-grained, record-level data lineage for RDD, Spark SQL /
+DataFrame, and PySpark jobs. After a job runs you can trace any output record
+backward to the exact input records that produced it, and forward again.
+
+This is the API reference. Narrative docs live alongside the code:
+[[https://github.com/SEED-VT/titian-spark-provenance README]], `INSTALL.md`,
+`ABLATION.md`, and the `tpcds/` coverage harness.
+
+==Where to start==
+
+Pick the API that matches your job:
+
+  - '''Spark SQL / DataFrames''' — [[org.apache.spark.sql.lineage.TitianSQL]] is the
+    entry point: `collectWithLineage`, `trace` (returns a
+    [[org.apache.spark.sql.lineage.TraceCursor]] with `goBack`/`goNext`/`show`),
+    `traceAllSources`, `lineageSize`, `releaseLineage`. Register
+    [[org.apache.spark.sql.lineage.TitianSQLExtension]] via
+    `--conf spark.sql.extensions=...` and toggle capture with
+    `spark.titian.sql.capture`.
+
+  - '''RDD API''' — wrap a `SparkContext` in
+    [[org.apache.spark.lineage.LineageContext]]; `setCaptureLineage(true)`, run a
+    job, then `getLineage()` / `goBack()` / `goNext()` / `show()`.
+
+  - '''PySpark''' — ship `python/titian.py`; `titian.Titian(spark)` wraps the SQL
+    API over py4j.
+
+==How capture works==
+
+Titian records compact `(inputId, outputId)` associations '''only at stage
+boundaries''', then stitches them lazily at trace time with recursive joins — the
+design of the VLDB paper, preserved here. Two mechanisms make it a library:
+
+  - The code lives in `org.apache.spark.*` packages, so it can use Spark's
+    `private[spark]` internals without forking (subclassing, DAG splicing, a few
+    reflective reads).
+  - SQL capture is injected as physical-plan tap operators via a
+    `SparkSessionExtensions` columnar rule, '''before''' `CollapseCodegenStages`, so
+    each tap's per-row capture is fused into Spark's generated Java — see
+    [[org.apache.spark.sql.lineage.TapExec]] and
+    [[org.apache.spark.sql.lineage.TitianSQLExtension]].
+
+Lineage is materialized into executor `BlockManager`s as compact primitive-array
+blocks ([[org.apache.spark.sql.lineage.TapBlock]]) and resolved by an executor-side
+filtering walk over those blocks.
+
+==Optimizations and tuning==
+
+Five capture/trace optimizations are '''on by default'''. Each can be switched off
+individually with `spark.titian.ablation` — for the ablation study or as a fallback —
+and every legacy path is verified to produce byte-identical lineage. See
+[[org.apache.spark.lineage.TitianAblation]] and `ABLATION.md`.
+
+`spark.titian.lineage.storageLevel` (default `MEMORY_AND_DISK_SER`) tunes where
+lineage blocks live; [[org.apache.spark.sql.lineage.TitianSQL.lineageSize]] reports a
+query's footprint.
+
+==Scope and guarantees==
+
+Capture supports a defined operator set and '''fails loudly''' on anything outside it
+(a clear `TitianUnsupportedOperatorException`) — never silent wrong lineage. Trace
+granularity across shuffles is key-hash level (all records sharing the key);
+broadcast-join probe sides are exact. `show()` resolves traces by deterministically
+re-scanning the source files, valid while those files are unchanged.

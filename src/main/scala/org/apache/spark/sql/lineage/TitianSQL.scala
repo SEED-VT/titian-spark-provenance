@@ -39,11 +39,26 @@ import org.apache.spark.util.PackIntIntoLong
  *
  * Backward/forward traversal mirrors the RDD LineageRDD API: `goBack(path)` follows
  * join input `path`; `show()` resolves source rows at a scan level.
+ *
+ * @groupname capture Capture
+ * @groupdesc capture Toggle lineage capture for a session.
+ * @groupprio capture 0
+ * @groupname api Trace API
+ * @groupdesc api Collect results with lineage ids and walk them back to source rows.
+ * @groupprio api 1
+ * @groupname lifecycle Footprint & lifecycle
+ * @groupdesc lifecycle Inspect and release a query's materialized lineage blocks.
+ * @groupprio lifecycle 2
  */
 object TitianSQL {
 
+  /** Turn lineage capture on for `spark` (equivalent to setting
+   * `spark.titian.sql.capture=true`).
+   * @group capture */
   def enableCapture(spark: SparkSession): Unit =
     spark.conf.set("spark.titian.sql.capture", "true")
+  /** Turn lineage capture off for `spark`.
+   * @group capture */
   def disableCapture(spark: SparkSession): Unit =
     spark.conf.set("spark.titian.sql.capture", "false")
 
@@ -290,7 +305,8 @@ object TitianSQL {
 
   // ---------------------------------------------------------------- public API
 
-  /** Collect result rows paired with their packed output lineage ids. */
+  /** Collect result rows paired with their packed output lineage ids.
+   * @group api */
   def collectWithLineage(df: DataFrame): Array[(Row, Long)] = {
     val rows = df.collect() // triggers execution and capture
     // a query AQE collapsed to an empty relation carries no taps — and no rows
@@ -304,7 +320,8 @@ object TitianSQL {
     rows.zip(associations.map(_._1))
   }
 
-  /** Start a trace from packed result-row ids (from [[collectWithLineage]]). */
+  /** Start a trace from packed result-row ids (from [[collectWithLineage]]).
+   * @group api */
   def trace(df: DataFrame, outputIds: Seq[Long]): TraceCursor = {
     val graph = captureGraph(df)
     val wanted = outputIds.toSet
@@ -318,14 +335,16 @@ object TitianSQL {
     new TraceCursor(graph.spark, graph.source, locals, Nil)
   }
 
-  /** Convenience: full backward walk along join input 0 down to the (single) scan. */
+  /** Convenience: full backward walk along join input 0 down to the (single) scan.
+   * @group api */
   def backward(df: DataFrame, outputIds: Seq[Long]): Array[Long] = {
     var cursor = trace(df, outputIds)
     while (!cursor.atScan) { cursor = cursor.goBack(0) }
     cursor.ids
   }
 
-  /** Convenience for linear (single-scan) plans: resolve input ids to source rows. */
+  /** Convenience for linear (single-scan) plans: resolve input ids to source rows.
+   * @group api */
   def showInputs(df: DataFrame, inputIds: Seq[Long]): Array[Row] = {
     val graph = captureGraph(df)
     def findScan(s: SourceInfo): ScanSource = s match {
@@ -429,7 +448,8 @@ object TitianSQL {
     }
   }
 
-  /** Drop all lineage blocks captured for this query (long sessions accumulate). */
+  /** Drop all lineage blocks captured for this query (long sessions accumulate).
+   * @group lifecycle */
   def releaseLineage(df: DataFrame): Unit = {
     // a query AQE collapsed to an empty relation carries no result tap (and the
     // reachable capture graph with it); nothing to release
@@ -439,7 +459,8 @@ object TitianSQL {
     allBlockIds(graph).foreach(master.removeBlock)
   }
 
-  /** (memoryBytes, diskBytes) currently held by this query's lineage blocks. */
+  /** (memoryBytes, diskBytes) currently held by this query's lineage blocks.
+   * @group lifecycle */
   def lineageSize(df: DataFrame): (Long, Long) = {
     if (!finalPlan(df).exists(_.isInstanceOf[TapResultExec])) return (0L, 0L)
     val graph = captureGraph(df)
@@ -450,13 +471,15 @@ object TitianSQL {
     }
   }
 
-  /** Py4J-friendly: packed lineage ids aligned with `df.collect()` row order. */
+  /** Py4J-friendly: packed lineage ids aligned with `df.collect()` row order.
+   * @group api */
   def resultIds(df: DataFrame): Array[Long] = {
     val graph = captureGraph(df)
     resultAssociations(graph.spark, graph.resultTapId).map(_._1)
   }
 
-  /** Py4J-friendly trace entry point (accepts a Java list of numbers). */
+  /** Py4J-friendly trace entry point (accepts a Java list of numbers).
+   * @group api */
   def traceJava(df: DataFrame, outputIds: java.util.List[java.lang.Number]): TraceCursor = {
     import scala.jdk.CollectionConverters._
     trace(df, outputIds.asScala.map(_.longValue()).toSeq)
@@ -476,6 +499,7 @@ object TitianSQL {
    * Trace the given result rows backward through EVERY branch (all join inputs, all
    * union children) and resolve witnesses at each reachable source. One entry per
    * scan level — the complete provenance frontier of the traced rows.
+   * @group api
    */
   def traceAllSources(df: DataFrame, outputIds: Seq[Long]): Seq[SourceWitnesses] =
     trace(df, outputIds).showAllSources()
