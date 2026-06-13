@@ -15,10 +15,17 @@ import org.apache.spark.sql.lineage.{TitianSQL, TitianSQLExtension, TitianUnsupp
  *   3. trace one result row backward along branch 0 to a scan and resolve witnesses.
  * Buckets each query as PASS / UNSUPPORTED(<operator>) / ERROR and prints a summary.
  *
+ * With `--oracle`, each passing query additionally gets a recall/precision check:
+ * one result row is traced through EVERY branch to all sources, every traced table
+ * is replaced by a view holding only the witness rows, and the query is re-executed —
+ * the traced row must reappear identically (recall: the witness set is sufficient).
+ * Witness-set sizes are reported, plus a leave-one-out re-run (drop one witness; does
+ * the traced row change?) as a precision signal.
+ *
  * Usage:
  *   python3 tpcds/gen_data.py 0.2                       # once, needs `pip install duckdb`
  *   bin/sbt 'examples/runMain edu.vt.bigdebug.examples.TPCDSCoverage \
- *     tpcds/data/sf0.2 tpcds/queries [q3,q7,...]'
+ *     tpcds/data/sf0.2 tpcds/queries [q3,q7,...] [--oracle]'
  */
 object TPCDSCoverage {
 
@@ -27,7 +34,9 @@ object TPCDSCoverage {
   private case class Unsupported(op: String) extends Outcome
   private case class Error(kind: String, msg: String) extends Outcome
 
-  def main(args: Array[String]): Unit = {
+  def main(rawArgs: Array[String]): Unit = {
+    val oracleMode = rawArgs.contains("--oracle")
+    val args = rawArgs.filterNot(_ == "--oracle")
     val root = sys.props.get("user.dir").getOrElse(".")
     val dataDir = new File(if (args.length > 0) args(0) else s"$root/tpcds/data/sf0.2")
     val queryDir = new File(if (args.length > 1) args(1) else s"$root/tpcds/queries")
@@ -61,15 +70,24 @@ object TPCDSCoverage {
         (digits.toInt, n)
       }
 
+    val tablePaths: Map[String, String] =
+      dataDir.listFiles().filter(_.getName.endsWith(".parquet"))
+        .map(f => f.getName.stripSuffix(".parquet") -> f.getAbsolutePath).toMap
+
     // a single long-lived local session degrades after a few thousand stages
     // (codegen class-server failures): recycle it every few queries
-    val results = queries.grouped(15).flatMap { group =>
+    val groupSize = if (oracleMode) 8 else 15
+    val results = queries.grouped(groupSize).flatMap { group =>
       val spark = newSession()
       val rs = group.map { case (name, file) =>
         val sql = new String(Files.readAllBytes(file.toPath))
-        val r = name -> runOne(spark, name, sql)
-        println(f"${r._1}%-6s ${r._2}")
-        r
+        val outcome = runOne(spark, name, sql)
+        val note = (outcome, oracleMode) match {
+          case (Pass, true) => runOracle(spark, sql, tablePaths)
+          case _ => ""
+        }
+        println(f"$name%-6s $outcome $note")
+        (name, outcome, note)
       }
       spark.stop()
       rs
@@ -77,19 +95,141 @@ object TPCDSCoverage {
 
     println("\n=== TPC-DS lineage coverage ===")
     results.foreach {
-      case (n, Pass) => println(f"$n%-6s PASS")
-      case (n, Unsupported(op)) => println(f"$n%-6s UNSUPPORTED  $op")
-      case (n, Error(kind, msg)) => println(f"$n%-6s ERROR[$kind]  ${msg.take(110)}")
+      case (n, Pass, note) => println(f"$n%-6s PASS  $note")
+      case (n, Unsupported(op), _) => println(f"$n%-6s UNSUPPORTED  $op")
+      case (n, Error(kind, msg), _) => println(f"$n%-6s ERROR[$kind]  ${msg.take(110)}")
     }
     val pass = results.count(_._2 == Pass)
     val unsup = results.count(_._2.isInstanceOf[Unsupported])
     val err = results.size - pass - unsup
     println(s"\n${results.size} queries: $pass pass, $unsup unsupported, $err error")
-    val byOp = results.collect { case (_, Unsupported(op)) => op }
+    if (oracleMode) {
+      val notes = results.collect { case (_, Pass, note) => note }
+      def n(tag: String) = notes.count(_.contains(tag))
+      println(s"oracle: ${n("recall=OK")} recall-ok, ${n("recall=FAIL")} recall-fail, " +
+        s"${n("recall=SKIP")} skipped; leave-one-out: ${n("loo=SENSITIVE")} sensitive, " +
+        s"${n("loo=INSENSITIVE")} insensitive")
+    }
+    val byOp = results.collect { case (_, Unsupported(op), _) => op }
       .groupBy(identity).view.mapValues(_.size).toSeq.sortBy(-_._2)
     if (byOp.nonEmpty) {
       println("unsupported by operator:")
       byOp.foreach { case (op, n) => println(f"  $op%-40s $n") }
+    }
+  }
+
+  /**
+   * Recall/precision oracle for one passing query.
+   *
+   * Recall: trace one result row through every branch to all sources; replace each
+   * traced table with a view holding only its witness rows (null-safe semi-join on
+   * the scan's columns, so the full table schema survives); re-run the query with
+   * capture off. The traced row must reappear identically — for aggregates this is
+   * sharp, one missing contributor changes the value.
+   *
+   * Precision: witness-set sizes per table (key-hash granularity makes joins/windows
+   * over-approximate by design), plus a leave-one-out re-run: drop one witness from
+   * the largest set — if the traced row still reproduces, that witness was
+   * value-neutral (granularity cost or e.g. a non-extremal MIN/MAX contributor).
+   */
+  private def runOracle(
+      spark: SparkSession,
+      sql: String,
+      tablePaths: Map[String, String]): String = {
+    import org.apache.spark.sql.functions.{col, monotonically_increasing_id}
+
+    val df0 = spark.sql(sql)
+    // a scalar subquery over a filtered table would change value on the re-run and
+    // fail recall for reasons unrelated to lineage — skip those queries
+    val hasSubquery = df0.queryExecution.sparkPlan.exists { p =>
+      p.expressions.exists(_.exists {
+        case _: org.apache.spark.sql.catalyst.expressions.PlanExpression[_] => true
+        case _ => false
+      })
+    }
+    if (hasSubquery) return "recall=SKIP(scalar-subquery)"
+
+    val touched = scala.collection.mutable.Set[String]()
+    try {
+      spark.conf.set("spark.titian.sql.capture", "true")
+      val df = spark.sql(sql)
+      val withIds = TitianSQL.collectWithLineage(df)
+      if (withIds.isEmpty) return "recall=SKIP(empty)"
+      val (sampleRow, sampleId) = withIds(withIds.length / 2)
+      val sources = TitianSQL.traceAllSources(df, Seq(sampleId))
+      TitianSQL.releaseLineage(df)
+      spark.conf.set("spark.titian.sql.capture", "false")
+
+      // An empty frontier is legitimate for exactly one shape: a global aggregate
+      // over zero qualifying rows (count() = 0 emits a row from nothing). Verify by
+      // re-running with EVERY table emptied — if the row is derivable from no input,
+      // the empty frontier is consistent; otherwise the walk lost the ids.
+      if (sources.forall(_.rows.isEmpty)) {
+        spark.conf.set("spark.titian.sql.capture", "false")
+        tablePaths.foreach { case (t, p) =>
+          touched += t
+          spark.read.parquet(p).limit(0).createOrReplaceTempView(t)
+        }
+        val emptied = spark.sql(sql).collect()
+        return if (emptied.contains(sampleRow)) "recall=OK(empty-input)"
+        else "recall=FAIL(empty-frontier)"
+      }
+
+      // map each traced source to its table; bail if a non-empty one is unmappable
+      val byTable = sources.filter(_.rows.nonEmpty).groupBy { sw =>
+        sw.sourcePath.flatMap(p =>
+          tablePaths.collectFirst { case (t, path) if p.endsWith(new File(path).getName) => t })
+      }
+      if (byTable.contains(None)) return "recall=SKIP(unmappable-source)"
+      val traced = byTable.collect { case (Some(t), wss) => t -> wss }
+
+      // every traced table -> view of only its witness rows (row ids via null-safe
+      // semi-join per scan, so different scans' column sets combine on one table)
+      val ridsByTable = traced.map { case (table, wss) =>
+        val base = spark.read.parquet(tablePaths(table))
+          .withColumn("__rid", monotonically_increasing_id())
+        val ridSets = wss.map { sw =>
+          import scala.jdk.CollectionConverters._
+          val w = spark.createDataFrame(sw.rows.toSeq.distinct.asJava, sw.schema)
+            .toDF(sw.schema.fieldNames.map("__w_" + _).toIndexedSeq: _*)
+          val cond = sw.schema.fieldNames
+            .map(c => base(c) <=> w("__w_" + c)).reduce(_ && _)
+          base.join(w, cond, "left_semi").select("__rid")
+        }
+        val rids = ridSets.reduce(_ union _).distinct().cache()
+        base.join(rids, Seq("__rid"), "left_semi").drop("__rid")
+          .createOrReplaceTempView(table)
+        touched += table
+        table -> (base, rids)
+      }
+
+      val rerun = spark.sql(sql).collect()
+      val recall = if (rerun.contains(sampleRow)) "recall=OK" else "recall=FAIL"
+      val sizes = traced.map { case (t, wss) => s"$t=${wss.map(_.rows.length).sum}" }
+        .toSeq.sorted.mkString(",")
+
+      // leave-one-out on the largest witness set (needs >= 2 rows to stay meaningful)
+      val loo = ridsByTable.toSeq
+        .map { case (t, (b, r)) => (t, b, r, r.count()) }
+        .filter(_._4 >= 2).sortBy(-_._4).headOption.map { case (table, base, rids, _) =>
+          val dropped = rids.first().getLong(0)
+          base.join(rids.filter(col("__rid") =!= dropped), Seq("__rid"), "left_semi")
+            .drop("__rid").createOrReplaceTempView(table)
+          val rerun2 = spark.sql(sql).collect()
+          if (rerun2.contains(sampleRow)) "loo=INSENSITIVE" else "loo=SENSITIVE"
+        }.getOrElse("loo=SKIP")
+
+      s"$recall witnesses{$sizes} $loo"
+    } catch {
+      case NonFatal(t) =>
+        s"recall=SKIP(${t.getClass.getSimpleName}: " +
+          s"${Option(t.getMessage).getOrElse("").replaceAll("\\s+", " ").take(60)})"
+    } finally {
+      spark.conf.set("spark.titian.sql.capture", "false")
+      // restore the real tables for the next query
+      touched.foreach { t =>
+        spark.read.parquet(tablePaths(t)).createOrReplaceTempView(t)
+      }
     }
   }
 

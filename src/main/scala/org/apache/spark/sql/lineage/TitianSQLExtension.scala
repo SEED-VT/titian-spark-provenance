@@ -159,8 +159,17 @@ case class InsertTitianTaps(session: SparkSession) extends Rule[SparkPlan] with 
 
     // reduce-side capture above final aggregates and shuffle joins
     tapped = tapped.transformUp {
+      // Output-side aggregates need a post tap. Two shapes:
+      //  - reduce side of a shuffle: the matching pre tap was inserted on the map
+      //    side (pass 1);
+      //  - a fused pair (final directly over partial, no shuffle — the input was
+      //    already partitioned on the grouping keys, e.g. a GROUP BY over a union
+      //    of identically-grouped aggregates): the aggregate still breaks 1:1 id
+      //    threading, so it gets its own pre tap below the pair. Without this the
+      //    next tap up records stale ids — silently wrong lineage.
       case agg: HashAggregateExec
-        if isReduceSide(agg.child) && !agg.isInstanceOf[TapPostKeyedExec] =>
+        if (isReduceSide(agg.child) || fusedPartialOf(agg).isDefined) &&
+          !agg.isInstanceOf[TapPostKeyedExec] =>
         // The grouping values may surface in the output under an Alias (e.g.
         // GROUP BY upper(c) ... SELECT upper(c) AS x): resolve each grouping attr to
         // the output attribute that carries its value. Grouping attrs pruned from the
@@ -179,10 +188,45 @@ case class InsertTitianTaps(session: SparkSession) extends Rule[SparkPlan] with 
         }
         val keyAttrs = groupAttrs.zip(resolved).map { case (g, r) => r.getOrElse(g) }
         val missing = groupAttrs.zip(resolved).collect { case (g, None) => g }
+        val body = fusedPartialOf(agg) match {
+          case Some(partial) if !isReduceSide(agg.child) =>
+            val keys = visibleGroupKeys(partial.groupingExpressions)
+            partial.child match {
+              case u: UnionExec =>
+                // Fusion implies the union is partitioner-ALIGNED at runtime (child
+                // partitions zipped, not concatenated), so positional ids are
+                // ambiguous across children. One pre tap per child — keyed on the
+                // outer grouping keys rebased onto that child's output — makes the
+                // branch the tap identity instead of a partition range.
+                val tappedChildren = u.children.map { c =>
+                  if (!idSafeFromShuffle(c)) {
+                    throw new TitianUnsupportedOperatorException(agg)
+                  }
+                  val rebased = keys.map(_.transform {
+                    case ar: org.apache.spark.sql.catalyst.expressions.AttributeReference =>
+                      val j = u.output.indexWhere(_.exprId == ar.exprId)
+                      if (j < 0) throw new TitianUnsupportedOperatorException(agg)
+                      c.output(j)
+                  })
+                  TapPreExchangeExec(session.sparkContext.newRddId(), rebased, c)
+                }
+                agg.withNewChildren(Seq(partial.withNewChildren(
+                  Seq(u.withNewChildren(tappedChildren)))))
+              case other =>
+                if (!idSafeFromShuffle(other)) {
+                  throw new TitianUnsupportedOperatorException(agg)
+                }
+                val pre = TapPreExchangeExec(
+                  session.sparkContext.newRddId(), keys, other)
+                agg.withNewChildren(Seq(partial.withNewChildren(Seq(pre))))
+            }
+          case _ => agg
+        }
         if (missing.isEmpty) {
-          TapPostKeyedExec(session.sparkContext.newRddId(), keyAttrs, agg)
+          TapPostKeyedExec(session.sparkContext.newRddId(), keyAttrs, body)
         } else {
-          val augmented = agg.copy(resultExpressions = agg.resultExpressions ++ missing)
+          val augmented = body.asInstanceOf[HashAggregateExec]
+            .copy(resultExpressions = agg.resultExpressions ++ missing)
           ProjectExec(agg.output,
             TapPostKeyedExec(session.sparkContext.newRddId(), keyAttrs, augmented))
         }
@@ -207,12 +251,31 @@ case class InsertTitianTaps(session: SparkSession) extends Rule[SparkPlan] with 
         if (!idSafeFromShuffle(streamedPlan)) {
           throw new TitianUnsupportedOperatorException(j)
         }
-        TapPostBroadcastJoinExec(session.sparkContext.newRddId(),
-          TitianJoinKeys.rewrite(streamedKeys), j)
+        // mark tap on the streamed side: saves the probe id as the row enters the
+        // join, so fan-out matches all record the right probe row
+        val tapId = session.sparkContext.newRddId()
+        val marked = TapProbeMarkExec(tapId, streamedPlan)
+        val joined =
+          if (buildRight) j.withNewChildren(Seq(marked, j.right))
+          else j.withNewChildren(Seq(j.left, marked))
+        TapPostBroadcastJoinExec(tapId, tapId,
+          TitianJoinKeys.rewrite(streamedKeys), joined)
 
       case w: WindowExec if isReduceSide(w.child) =>
         // window-partition (peer set) granularity: key outputs by the partition spec
         TapPostKeyedExec(session.sparkContext.newRddId(), w.partitionSpec, w)
+
+      case w: WindowExec =>
+        // same-pipeline window (input already partitioned, no shuffle directly
+        // below): like the fused aggregate, it buffers per partition and breaks 1:1
+        // threading — give the level its own pre tap
+        if (!idSafeFromShuffle(w.child)) {
+          throw new TitianUnsupportedOperatorException(w)
+        }
+        val pre = TapPreExchangeExec(
+          session.sparkContext.newRddId(), w.partitionSpec, w.child)
+        TapPostKeyedExec(session.sparkContext.newRddId(), w.partitionSpec,
+          w.withNewChildren(Seq(pre)))
 
       // ORDER BY ... LIMIT selects rows by sort key: treat it exactly like a shuffle
       // boundary — pre tap below keyed by the sort expressions, post tap above keyed
@@ -289,6 +352,10 @@ case class InsertTitianTaps(session: SparkSession) extends Rule[SparkPlan] with 
   private def idSafeFromShuffle(p: SparkPlan): Boolean = p match {
     case _: ShuffleQueryStageExec | _: ShuffleExchangeExec | _: AQEShuffleReadExec =>
       false
+    // a partitioner-aligned union zips child partitions into shared tasks, making
+    // positional ids ambiguous across children (the fused-aggregate path handles
+    // this with per-child pre taps; everything else must not record above it)
+    case u: UnionExec if isAlignedUnion(u) => false
     // keyed operators get a post tap (pass 2) that re-bases ids on their outputs
     case _: HashAggregateExec | _: SortMergeJoinExec | _: ShuffledHashJoinExec |
          _: BroadcastHashJoinExec | _: WindowExec |
@@ -297,6 +364,19 @@ case class InsertTitianTaps(session: SparkSession) extends Rule[SparkPlan] with 
     case leaf if leaf.children.isEmpty => true
     case other => other.children.forall(idSafeFromShuffle)
   }
+
+  /**
+   * Heuristic for `SparkContext.union` zipping partitions instead of concatenating:
+   * it does so when all children expose compatible partitioners — at the plan level,
+   * hash-partitioned outputs on every child.
+   */
+  private def isAlignedUnion(u: UnionExec): Boolean =
+    u.children.forall { c =>
+      c.outputPartitioning match {
+        case _: HashPartitioning => true
+        case p => p.getClass.getSimpleName.contains("HashPartitioning")
+      }
+    }
 
   private def isCommand(p: SparkPlan): Boolean = p.exists { node =>
     val name = node.getClass.getSimpleName
@@ -332,6 +412,19 @@ case class InsertTitianTaps(session: SparkSession) extends Rule[SparkPlan] with 
       leftKeys.zip(rightKeys).map { case (l, r) => Coalesce(Seq(l, r)) }
     case _ => leftKeys
   }
+
+  /**
+   * The partial aggregate fused directly under a final one — no shuffle between,
+   * because the input was already partitioned on the grouping keys (e.g. GROUP BY
+   * over a union of identically-grouped aggregates).
+   */
+  private def fusedPartialOf(agg: HashAggregateExec): Option[HashAggregateExec] =
+    agg.child match {
+      case p: HashAggregateExec
+        if p.groupingExpressions.map(_.toAttribute.exprId) ==
+           agg.groupingExpressions.map(_.toAttribute.exprId) => Some(p)
+      case _ => None
+    }
 
   /** The shuffle-read side: final aggregate / join inputs arrive from an exchange. */
   private def isReduceSide(p: SparkPlan): Boolean = p match {

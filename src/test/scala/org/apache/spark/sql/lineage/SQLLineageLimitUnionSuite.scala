@@ -132,6 +132,36 @@ class SQLLineageLimitUnionSuite extends AnyFunSuite with BeforeAndAfterEach
     first.goNext().goNext().ids should have length 1
   }
 
+  test("GROUP BY over a union of identically-grouped aggregates — fused pair tapped") {
+    val s = newSession()
+    // the inner aggregates already partition by category, so Spark fuses the outer
+    // aggregate (partial+final, no shuffle) — the TPC-DS q33/q56/q60/q66 shape that
+    // silently produced stale ids before the fused-pair taps
+    val df = s.sql(
+      """SELECT category, SUM(t) AS total FROM (
+        |  SELECT category, SUM(amount) AS t FROM sales GROUP BY category
+        |  UNION ALL
+        |  SELECT category, SUM(amount) AS t FROM sales GROUP BY category
+        |) GROUP BY category ORDER BY total DESC LIMIT 2""".stripMargin)
+    val output = TitianSQL.collectWithLineage(df)
+    output.map(_._1).toSeq should equal (
+      Seq(Row("electronics", 2L * 101109), Row("furniture", 2L * 865)))
+
+    // limit -> outer aggregate; the fused aggregate's branches are its per-union-
+    // child pre taps, so branch i walks into union child i down to the exact
+    // electronics source rows. Before the fused-pair taps this silently walked
+    // into the wrong group entirely.
+    val agg = TitianSQL.trace(df, Seq(output.head._2)).goBack()
+    Seq(0, 1).foreach { branch =>
+      var cursor = agg.goBack(branch)
+      while (!cursor.atScan) { cursor = cursor.goBack() }
+      val witnesses = cursor.show()
+      witnesses should have length 4
+      witnesses.map(_.getInt(1)).sum should equal (101109)
+      witnesses.foreach(_.getString(0) should equal ("electronics"))
+    }
+  }
+
   test("UNION ALL + aggregate + ORDER BY LIMIT — the TPC-DS result shape end-to-end") {
     val s = newSession()
     val df = s.sql(

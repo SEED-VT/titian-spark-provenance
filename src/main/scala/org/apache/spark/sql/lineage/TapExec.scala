@@ -136,17 +136,71 @@ case class TapPostKeyedExec(tapId: Int, keyExprs: Seq[Expression], child: SparkP
 }
 
 /**
+ * Below the streamed side of a BroadcastHashJoin: saves the probe row's id into the
+ * join's mark slot as the row enters the join. Required because a fan-out join's
+ * matches are emitted depth-first — `currentInputId` is already overwritten by the
+ * first match's downstream taps when the second match emerges.
+ */
+case class TapProbeMarkExec(pairId: Int, child: SparkPlan) extends TitianTapExec {
+
+  override def doConsume(ctx: CodegenContext, input: Seq[ExprCode], row: ExprCode): String = {
+    val tap = ctx.addMutableState(
+      classOf[ProbeMarkTapRuntime].getName, "titianProbeMarkTap",
+      v => s"$v = new ${classOf[ProbeMarkTapRuntime].getName}($pairId);")
+    s"""
+       |$tap.tap();
+       |${consume(ctx, input)}
+     """.stripMargin
+  }
+
+  override protected def doExecute(): RDD[InternalRow] = {
+    child.execute().mapPartitionsInternal { iter =>
+      val tap = new ProbeMarkTapRuntime(pairId)
+      iter.map { r => tap.tap(); r }
+    }
+  }
+
+  override protected def withNewChildInternal(newChild: SparkPlan): TapProbeMarkExec =
+    copy(child = newChild)
+}
+
+/**
  * Above a BroadcastHashJoin: (packedOutIdx -> (streamKeyHash, probeInputId)).
  * keyExprs must be the join's *rewritten* streamed keys so the hash matches the build
- * side's pre-broadcast tap (which hashes the broadcast mode's rewritten keys).
+ * side's pre-broadcast tap (which hashes the broadcast mode's rewritten keys). The
+ * probe id is read from the mark slot the join's [[TapProbeMarkExec]] writes
+ * (`pairId` pairs them).
  */
-case class TapPostBroadcastJoinExec(tapId: Int, keyExprs: Seq[Expression], child: SparkPlan)
+case class TapPostBroadcastJoinExec(
+    tapId: Int, pairId: Int, keyExprs: Seq[Expression], child: SparkPlan)
   extends KeyedTapExec {
 
   override protected def runtimeClass: Class[_] = classOf[PostJoinTapRuntime]
 
-  override protected def doExecute(): RDD[InternalRow] =
-    interpretedTap((tap, h) => tap.asInstanceOf[PostJoinTapRuntime].tap(h))
+  override def doConsume(ctx: CodegenContext, input: Seq[ExprCode], row: ExprCode): String = {
+    val tap = ctx.addMutableState(
+      runtimeClass.getName, "titianKeyedTap",
+      v => s"$v = new ${runtimeClass.getName}($tapId, $pairId);")
+    ctx.currentVars = input
+    val boundKeys = BindReferences.bindReferences[Expression](keyExprs, child.output)
+    val keyEv = GenerateUnsafeProjection.createCode(ctx, boundKeys)
+    s"""
+       |${keyEv.code}
+       |$tap.tap(${keyEv.value}.hashCode());
+       |${consume(ctx, input)}
+     """.stripMargin
+  }
+
+  override protected def doExecute(): RDD[InternalRow] = {
+    val keys = keyExprs
+    val childOutput = child.output
+    val (tid, pid) = (tapId, pairId)
+    child.execute().mapPartitionsInternal { iter =>
+      val proj = UnsafeProjection.create(keys, childOutput)
+      val tap = new PostJoinTapRuntime(tid, pid)
+      iter.map { r => tap.tap(proj(r).hashCode()); r }
+    }
+  }
 
   override protected def withNewChildInternal(newChild: SparkPlan): TapPostBroadcastJoinExec =
     copy(child = newChild)

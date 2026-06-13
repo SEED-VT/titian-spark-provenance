@@ -212,9 +212,18 @@ Current scoreboard (sf=0.2, Spark 4.1.2, AQE on):
 
 | outcome | queries |
 |---|---|
-| **PASS** — identical answers + 1-row backward trace to source rows | **59 / 103** |
-| UNSUPPORTED — capture aborts loudly on an out-of-scope operator | 43 |
+| **PASS** — identical answers + 1-row backward trace to source rows | **61 / 103** |
+| UNSUPPORTED — capture aborts loudly on an out-of-scope operator | 41 |
 | ERROR — q90 only: `DIVIDE_BY_ZERO` in the *baseline* at this tiny scale factor | 1 |
+
+A re-execution **oracle** (`--oracle`) further verifies ground truth per passing
+query: one result row is traced through every branch to all sources, each traced
+table is replaced by only its witness rows, and the query is re-run — the traced
+row must reproduce identically. Result: **45 / 45 oracle-checkable queries pass
+recall, 0 failures** (16 skipped: scalar subqueries or empty results at sf0.2).
+The oracle caught three silent wrong-lineage bugs on first deployment (fused
+aggregate pairs, aligned unions, fan-out broadcast joins) — all fixed; details in
+[`tpcds/`](tpcds/).
 
 The unsupported buckets, by blocking operator: shuffle/broadcast capture fed by an
 untapped shuffle (34 — Titian's soundness guard refuses to record stale row ids;

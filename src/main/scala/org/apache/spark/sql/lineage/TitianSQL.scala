@@ -124,7 +124,19 @@ object TitianSQL {
         KeyedSource(t.tapId, hasProbe = false,
           Seq(HashBranch(pre.tapId, parseSource(pre.child))))
       case None =>
-        KeyedSource(t.tapId, hasProbe = false, directShuffles(t.child).map(parseBranch))
+        // Same-pipeline pre taps (fused aggregate / same-pipeline window) are keyed
+        // on exactly this level's keys — they take precedence over deeper shuffles,
+        // whose partitioning keys may be a subset (clustered-distribution reuse)
+        // and hash differently. A fused aggregate over an aligned union carries one
+        // pre tap per union child: each becomes a branch in child order.
+        val pres = directPreTaps(t.child)
+        val branches =
+          if (pres.nonEmpty) {
+            pres.map(pre => HashBranch(pre.tapId, parseSource(pre.child, partOffset)))
+          } else {
+            directShuffles(t.child).map(parseBranch)
+          }
+        KeyedSource(t.tapId, hasProbe = false, branches)
     }
     case t: TapPostBroadcastJoinExec =>
       val bhj = t.child.asInstanceOf[
@@ -207,6 +219,18 @@ object TitianSQL {
     case top: org.apache.spark.sql.execution.TakeOrderedAndProjectExec => Some(top)
     case ia: org.apache.spark.sql.execution.InputAdapter => topBelow(ia.child)
     case _ => None
+  }
+
+  /**
+   * Same-pipeline pre taps directly below a keyed level — stopping at shuffle
+   * boundaries and at other keyed taps (which belong to deeper levels). In child
+   * order, so a fused aggregate's per-union-child taps index its branches.
+   */
+  private def directPreTaps(p: SparkPlan): Seq[TapPreExchangeExec] = p match {
+    case t: TapPreExchangeExec => Seq(t)
+    case _: ShuffleQueryStageExec | _: ShuffleExchangeExec => Nil
+    case _: TapPostKeyedExec | _: TapPostBroadcastJoinExec => Nil
+    case other => other.children.flatMap(directPreTaps)
   }
 
   private def firstPreTap(p: SparkPlan): Option[TapPreExchangeExec] = p match {
@@ -416,6 +440,24 @@ object TitianSQL {
     import scala.jdk.CollectionConverters._
     trace(df, outputIds.asScala.map(_.longValue()).toSeq)
   }
+
+  /**
+   * Witnesses at one source level of a full-tree trace. `sourcePath` is the file
+   * source's root location when the level is a file scan (None for cached relations
+   * and empty-relation leaves), so callers can map witnesses back to their tables.
+   */
+  case class SourceWitnesses(
+      sourcePath: Option[String],
+      rows: Array[Row],
+      schema: org.apache.spark.sql.types.StructType)
+
+  /**
+   * Trace the given result rows backward through EVERY branch (all join inputs, all
+   * union children) and resolve witnesses at each reachable source. One entry per
+   * scan level — the complete provenance frontier of the traced rows.
+   */
+  def traceAllSources(df: DataFrame, outputIds: Seq[Long]): Seq[SourceWitnesses] =
+    trace(df, outputIds).showAllSources()
 }
 
 /**
@@ -552,6 +594,26 @@ class TraceCursor private[lineage] (
       TitianSQL.showScanRows(spark, scan, ids.toSeq, full, off)
     case _ => throw new UnsupportedOperationException(
       "show() resolves source rows — goBack to a scan level first")
+  }
+
+  /**
+   * Resolve witnesses at every source level reachable from here, following every
+   * branch of every join/union below — the full provenance frontier of `ids`.
+   */
+  def showAllSources(): Seq[TitianSQL.SourceWitnesses] = source match {
+    case ScanSource(scan, off) =>
+      val (rows, schema) =
+        TitianSQL.showScanRowsWithSchema(spark, scan, ids.toSeq, full = false, off)
+      val path = scan match {
+        case fs: FileSourceScanExec =>
+          fs.relation.location.rootPaths.headOption.map(_.toString)
+        case _ => None
+      }
+      Seq(TitianSQL.SourceWitnesses(path, rows, schema))
+    case KeyedSource(_, _, branches) =>
+      branches.indices.flatMap(i => goBack(i).showAllSources())
+    case UnionSource(children, _, _) =>
+      children.indices.flatMap(i => goBack(i).showAllSources())
   }
 
   /** Py4J-friendly: source rows as JSON strings. */

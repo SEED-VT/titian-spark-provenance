@@ -77,9 +77,66 @@ What each outcome certifies:
   divide-by-zero, which fails in the baseline too).
 
 The trace check follows branch 0 at every multi-input level — one root-to-scan
-path. It proves the id/key-hash chain is consistent across levels; it does not
-re-derive ground truth for every row (that re-execution oracle is a roadmap item).
+path. It proves the id/key-hash chain is consistent across levels. Ground truth is
+the oracle's job:
+
+## Recall / precision oracle (`--oracle`)
+
+For every PASS query the oracle re-derives ground truth by re-execution:
+
+```
+        traced result row r ──(trace through EVERY branch)──► witnesses per table
+                                                                    │
+   for each traced table T:  T' = T ⋉ witnesses(T)                  │
+   (null-safe semi-join on the scan's columns — full schema,        │
+    multiple scans of one table union their row-id sets)            │
+                                                                    ▼
+   re-run the same SQL on the substituted views (capture off)
+                                                                    │
+        ┌───────────────────────────────────────────────────────────┤
+        ▼                                                           ▼
+   RECALL:  r must reappear identically.                    PRECISION signals:
+   The witness set is SUFFICIENT — for aggregates           • witness-set size per
+   this is sharp: one missing contributor changes             table (key-hash
+   the SUM/COUNT/AVG.                                         granularity cost)
+                                                            • leave-one-out: drop 1
+                                                              witness, re-run — row
+                                                              changed ⇒ SENSITIVE
+                                                              (witness necessary)
+```
+
+```bash
+sbt 'examples/runMain edu.vt.bigdebug.examples.TPCDSCoverage tpcds/data/sf0.2 tpcds/queries --oracle'
+# per query:  q3  PASS  recall=OK witnesses{date_dim=7,item=1,store_sales=9} loo=SENSITIVE
+```
+
+Current results (sf=0.2): **61/103 queries pass**; of those, every query the oracle can
+exercise passes recall — **45 recall-OK** (5 of them the verified zero-input global
+aggregate case), **0 recall-FAIL**, 16 skipped (scalar subqueries / empty results at
+this scale factor). Leave-one-out: 27 sensitive, 6 insensitive.
+
+The oracle earned its keep on first contact: it caught **three silent
+wrong-lineage bugs** that every consistency check had passed — a fused
+partial+final aggregate pair (no shuffle between) recording stale ids, ambiguous
+positional ids across partitioner-aligned union children, and probe-id corruption
+in fan-out broadcast joins (depth-first match traversal overwrites
+`currentInputId` between matches). All three are fixed with dedicated taps
+(fused-pair pre taps, per-union-child pre taps, probe-mark taps).
+
+Oracle caveats, stated honestly:
+
+- Recall is the pass/fail half. Precision is reported, not asserted — key-hash
+  granularity returns whole key groups across shuffles *by design* (joins with
+  duplicate keys, window peer sets), so witness sets can legitimately exceed the
+  minimal contributing set.
+- `loo=INSENSITIVE` is a signal, not a verdict: a dropped witness can be
+  value-neutral (non-extremal MIN/MAX contributor, granularity over-approximation).
+- Queries with scalar subqueries are skipped (`recall=SKIP`): the subquery would be
+  re-evaluated over the filtered tables and change value for reasons unrelated to
+  lineage.
+- Duplicate full rows in a source are conflated by the value-based semi-join (a
+  missing contributor that is a byte-identical copy of a witness can't be detected).
 ```bash
 # inspect one query's walk interactively
-sbt 'examples/runMain edu.vt.bigdebug.examples.TPCDSCoverage tpcds/data/sf0.2 tpcds/queries q3'
+sbt 'examples/runMain edu.vt.bigdebug.examples.TPCDSCoverage tpcds/data/sf0.2 tpcds/queries q3 --oracle'
 ```

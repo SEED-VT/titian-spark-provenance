@@ -122,12 +122,25 @@ class PostKeyedTapRuntime(tapId: Int) {
 }
 
 /**
+ * Below the streamed side of a BroadcastHashJoin: saves the probe row's input id into
+ * the join's mark slot as the row ENTERS the join. The matches of a fan-out join are
+ * traversed depth-first, so by the time the second match emerges from the join,
+ * `currentInputId` has been overwritten by the first match's downstream taps — the
+ * post-join tap must read this saved mark instead.
+ */
+class ProbeMarkTapRuntime(pairId: Int) {
+  private val state = LineageTaskState.get(TaskContext.get())
+
+  def tap(): Unit = state.probeMarks.put(pairId, state.currentInputId)
+}
+
+/**
  * Broadcast-join tap: above a BroadcastHashJoin on the probe (streamed) side. Records
  * (packed(partition, outIdx) -> (keyHash, probeInputId)) — the key hash locates the
- * build side's broadcast lineage; the probe id is EXACT row provenance, since the
- * probe row is the pipeline's current row when the join emits.
+ * build side's broadcast lineage; the probe id is EXACT row provenance, read from the
+ * mark its [[ProbeMarkTapRuntime]] saved when the streamed row entered the join.
  */
-class PostJoinTapRuntime(tapId: Int) {
+class PostJoinTapRuntime(tapId: Int, pairId: Int) {
   private val ctx = TaskContext.get()
   private val state = LineageTaskState.get(ctx)
   private val split = ctx.partitionId()
@@ -141,7 +154,7 @@ class PostJoinTapRuntime(tapId: Int) {
 
   def tap(keyHash: Int): Unit = {
     val outIdx = pairs.size()
-    pairs.add(PackIntIntoLong(keyHash, state.currentInputId))
+    pairs.add(PackIntIntoLong(keyHash, state.probeMarks.get(pairId)))
     state.currentInputId = outIdx
   }
 }

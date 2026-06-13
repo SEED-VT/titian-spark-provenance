@@ -51,6 +51,14 @@ class LineageTaskState {
    */
   val seqBuffers = new java.util.HashMap[Int, it.unimi.dsi.fastutil.ints.IntArrayList]()
 
+  /**
+   * Per-join saved probe ids. A fan-out join's matches are traversed depth-first:
+   * the first match's downstream taps overwrite `currentInputId` before the second
+   * match emerges, so the join's post tap must read the probe id its mark tap saved
+   * when the streamed row ENTERED the join, keyed by the join's pair id.
+   */
+  val probeMarks = new it.unimi.dsi.fastutil.ints.Int2IntOpenHashMap()
+
   def getFromBufferPool(): Array[Byte] = LineageTaskState.getFromBufferPool()
 
   def getFromBufferPoolLarge(): Array[Byte] = LineageTaskState.getFromBufferPoolLarge()
