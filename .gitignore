@@ -22,3 +22,4 @@ SQL_LINEAGE_PLAN.md
 ROADMAP.md
 CLAUDE.md
 tpcds/data/
+tpcds/ablation.csv

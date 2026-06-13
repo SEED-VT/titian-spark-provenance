@@ -254,6 +254,11 @@ Lineage block storage is tunable with `spark.titian.lineage.storageLevel`
 (default `MEMORY_AND_DISK_SER`); inspect a query's footprint with
 `TitianSQL.lineageSize(df)`.
 
+Each optimization can be toggled off individually with `spark.titian.ablation` (all
+on by default) — for ablation studies or as a fallback. Every legacy path is verified
+to produce byte-identical lineage (full suite green under each flag). See
+[`ABLATION.md`](ABLATION.md).
+
 ## Documentation
 
 - [`INSTALL.md`](INSTALL.md) — build, test, cluster deployment, and notebook setup.

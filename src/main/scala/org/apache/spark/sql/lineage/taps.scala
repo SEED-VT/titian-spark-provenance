@@ -52,6 +52,18 @@ private[lineage] case class JoinBlock(split: Int, pairs: Array[Long]) extends Ta
 private[lineage] case class PreExchangeBlock(
     split: Int, hashes: Array[Int], idLists: Array[Array[Int]]) extends TapBlock
 
+// ---- ablation-only legacy block shapes: one boxed tuple per captured row ----------
+
+/** Ablation (boxedBlocks): rows are (packedOutId: Long, value: Long) tuples. */
+private[lineage] case class BoxedKeyedBlock(split: Int, rows: Array[Any]) extends TapBlock
+
+/** Ablation (boxedBlocks): rows are (packedOutId, (keyHash, probeId)) tuples. */
+private[lineage] case class BoxedJoinBlock(split: Int, rows: Array[Any]) extends TapBlock
+
+/** Ablation (boxedBlocks): rows are (keyHash, Array[inputId]) tuples, hash-sorted. */
+private[lineage] case class BoxedPreExchangeBlock(split: Int, rows: Array[Any])
+  extends TapBlock
+
 private[lineage] object TapBlock {
   /**
    * Where lineage blocks live, `spark.titian.lineage.storageLevel` (a cluster conf —
@@ -64,6 +76,34 @@ private[lineage] object TapBlock {
   def store(tapId: Int, split: Int, block: TapBlock): Unit =
     SparkEnv.get.blockManager.putSingle[Any](
       RDDBlockId(tapId, split), block, storageLevel, tellMaster = true)
+
+  // Normalizers: trace logic reads every block through these, so the compact and
+  // boxed (ablation) formats are semantically interchangeable.
+
+  def keyedValues(b: TapBlock): (Int, Array[Int]) = b match {
+    case KeyedBlock(s, v) => (s, v)
+    case BoxedKeyedBlock(s, rows) =>
+      (s, rows.map(_.asInstanceOf[(Long, Long)]._2.toInt))
+    case other => throw new IllegalStateException(s"not a keyed block: $other")
+  }
+
+  def joinPairs(b: TapBlock): (Int, Array[Long]) = b match {
+    case JoinBlock(s, p) => (s, p)
+    case BoxedJoinBlock(s, rows) =>
+      (s, rows.map { r =>
+        val (_, hp) = r.asInstanceOf[(Long, (Int, Int))]
+        PackIntIntoLong(hp._1, hp._2)
+      })
+    case other => throw new IllegalStateException(s"not a join block: $other")
+  }
+
+  def preEntries(b: TapBlock): (Int, Array[Int], Array[Array[Int]]) = b match {
+    case PreExchangeBlock(s, h, ids) => (s, h, ids)
+    case BoxedPreExchangeBlock(s, rows) =>
+      val typed = rows.map(_.asInstanceOf[(Int, Array[Int])])
+      (s, typed.map(_._1), typed.map(_._2))
+    case other => throw new IllegalStateException(s"not a pre-exchange block: $other")
+  }
 }
 
 /** Scan-side tap: assigns the per-task input row id (TapHadoopLRDD's role). */
@@ -92,7 +132,14 @@ class PreExchangeTapRuntime(tapId: Int) {
   ctx.addTaskCompletionListener[Unit] { _ =>
     val hashes = map.keySet().toIntArray
     java.util.Arrays.sort(hashes)
-    TapBlock.store(tapId, split, PreExchangeBlock(split, hashes, hashes.map(map.get(_).toArray)))
+    val block =
+      if (org.apache.spark.lineage.TitianAblation.boxedBlocks) {
+        BoxedPreExchangeBlock(split,
+          hashes.map(k => (k, map.get(k).toArray): Any))
+      } else {
+        PreExchangeBlock(split, hashes, hashes.map(map.get(_).toArray))
+      }
+    TapBlock.store(tapId, split, block)
   }
 
   /** Called once per pre-combine row with the murmur hash of its partition/group key. */
@@ -111,7 +158,7 @@ class PostKeyedTapRuntime(tapId: Int) {
   private val hashes = new it.unimi.dsi.fastutil.ints.IntArrayList()
 
   ctx.addTaskCompletionListener[Unit] { _ =>
-    TapBlock.store(tapId, split, KeyedBlock(split, hashes.toIntArray))
+    TapBlock.store(tapId, split, keyedBlockOf(split, hashes.toIntArray))
   }
 
   /** Called once per combined output row with the murmur hash of its key. */
@@ -119,6 +166,17 @@ class PostKeyedTapRuntime(tapId: Int) {
     state.currentInputId = hashes.size()
     hashes.add(keyHash)
   }
+}
+
+/** Compact or (ablation) boxed keyed block from per-row int values. */
+private object keyedBlockOf {
+  def apply(split: Int, values: Array[Int]): TapBlock =
+    if (org.apache.spark.lineage.TitianAblation.boxedBlocks) {
+      BoxedKeyedBlock(split,
+        values.zipWithIndex.map { case (v, i) =>
+          (PackIntIntoLong(split, i), v.toLong): Any
+        })
+    } else KeyedBlock(split, values)
 }
 
 /**
@@ -146,15 +204,39 @@ class PostJoinTapRuntime(tapId: Int, pairId: Int) {
   private val split = ctx.partitionId()
   // Capture stays primitive: one packed (keyHash, probeId) long per row. The row's
   // packed output id needs no storage — split is constant and outIdx is its position.
-  private val pairs = new it.unimi.dsi.fastutil.longs.LongArrayList()
+  // The boxedJoinBuffer ablation restores the pre-P2 boxed tuple buffer.
+  private val boxedBuffer = org.apache.spark.lineage.TitianAblation.boxedJoinBuffer
+  private val pairs =
+    if (boxedBuffer) null else new it.unimi.dsi.fastutil.longs.LongArrayList()
+  private val boxed =
+    if (boxedBuffer) new scala.collection.mutable.ArrayBuffer[Any]() else null
 
   ctx.addTaskCompletionListener[Unit] { _ =>
-    TapBlock.store(tapId, split, JoinBlock(split, pairs.toLongArray))
+    val longs =
+      if (boxedBuffer) {
+        boxed.map { r =>
+          val (_, hp) = r.asInstanceOf[(Long, (Int, Int))]
+          PackIntIntoLong(hp._1, hp._2)
+        }.toArray
+      } else pairs.toLongArray
+    val block =
+      if (org.apache.spark.lineage.TitianAblation.boxedBlocks) {
+        BoxedJoinBlock(split, longs.zipWithIndex.map { case (p, i) =>
+          (PackIntIntoLong(split, i),
+            (PackIntIntoLong.getLeft(p), PackIntIntoLong.getRight(p))): Any
+        })
+      } else JoinBlock(split, longs)
+    TapBlock.store(tapId, split, block)
   }
 
   def tap(keyHash: Int): Unit = {
-    val outIdx = pairs.size()
-    pairs.add(PackIntIntoLong(keyHash, state.probeMarks.get(pairId)))
+    val outIdx = if (boxedBuffer) boxed.size else pairs.size()
+    if (boxedBuffer) {
+      boxed += ((PackIntIntoLong(split, outIdx),
+        (keyHash, state.probeMarks.get(pairId))))
+    } else {
+      pairs.add(PackIntIntoLong(keyHash, state.probeMarks.get(pairId)))
+    }
     state.currentInputId = outIdx
   }
 }
@@ -194,7 +276,7 @@ class ResultTapRuntime(tapId: Int) {
   private val inputIds = new it.unimi.dsi.fastutil.ints.IntArrayList()
 
   ctx.addTaskCompletionListener[Unit] { _ =>
-    TapBlock.store(tapId, split, KeyedBlock(split, inputIds.toIntArray))
+    TapBlock.store(tapId, split, keyedBlockOf(split, inputIds.toIntArray))
   }
 
   /** Called once per output row. */

@@ -245,6 +245,8 @@ object TitianSQL {
    * Lineage blocks of a tap as an RDD — one compact [[TapBlock]] per partition, read
    * where it lives (preferred locations from the block managers). Trace steps flatMap
    * filtering closures over this, so only matching ids travel to the driver.
+   * The driverTrace ablation collects whole blocks to the driver instead and drops
+   * the block-locality hints (the pre-P4 behavior).
    */
   private[lineage] def tapBlocks[T <: TapBlock: ClassTag](
       spark: SparkSession, tapId: Int): RDD[T] = {
@@ -256,17 +258,35 @@ object TitianSQL {
     }, askStorageEndpoints = true).collect {
       case RDDBlockId(_, split) => split
     }.distinct.sorted
-    val locations = master
-      .getLocations(parts.map(p => RDDBlockId(tapId, p): BlockId).toArray)
-      .map(_.map(bm => ExecutorCacheTaskLocation(bm.host, bm.executorId).toString))
+    val locations =
+      if (org.apache.spark.lineage.TitianAblation.driverTrace) Nil
+      else master
+        .getLocations(parts.map(p => RDDBlockId(tapId, p): BlockId).toArray)
+        .map(_.map(bm => ExecutorCacheTaskLocation(bm.host, bm.executorId).toString))
     new TapBlockRDD[T](sc, tapId, parts, locations)
+  }
+
+  /**
+   * Run a filtering function over a tap's blocks. Optimized: executor-side flatMap,
+   * only matches return. driverTrace ablation: collect whole blocks, filter on the
+   * driver.
+   */
+  private[lineage] def mapBlocks[R: ClassTag](spark: SparkSession, tapId: Int)(
+      f: TapBlock => Iterator[R]): Array[R] = {
+    val rdd = tapBlocks[TapBlock](spark, tapId)
+    if (org.apache.spark.lineage.TitianAblation.driverTrace) {
+      rdd.collect().iterator.flatMap(f).toArray
+    } else {
+      rdd.flatMap(f).collect()
+    }
   }
 
   /** All (packedOutputId, value) pairs of a result tap, sorted by output id. */
   private def resultAssociations(spark: SparkSession, tapId: Int): Array[(Long, Int)] =
-    tapBlocks[KeyedBlock](spark, tapId).flatMap { b =>
-      b.values.indices.map(i => (PackIntIntoLong(b.split, i), b.values(i)))
-    }.collect().sortBy(_._1)
+    mapBlocks(spark, tapId) { b =>
+      val (split, values) = TapBlock.keyedValues(b)
+      values.indices.iterator.map(i => (PackIntIntoLong(split, i), values(i)))
+    }.sortBy(_._1)
 
   // ---------------------------------------------------------------- public API
 
@@ -288,12 +308,13 @@ object TitianSQL {
   def trace(df: DataFrame, outputIds: Seq[Long]): TraceCursor = {
     val graph = captureGraph(df)
     val wanted = outputIds.toSet
-    val locals = tapBlocks[KeyedBlock](graph.spark, graph.resultTapId).flatMap { b =>
-      b.values.indices.iterator.collect {
-        case i if wanted.contains(PackIntIntoLong(b.split, i)) =>
-          PackIntIntoLong(b.split, b.values(i))
+    val locals = mapBlocks(graph.spark, graph.resultTapId) { b =>
+      val (split, values) = TapBlock.keyedValues(b)
+      values.indices.iterator.collect {
+        case i if wanted.contains(PackIntIntoLong(split, i)) =>
+          PackIntIntoLong(split, values(i))
       }
-    }.collect()
+    }
     new TraceCursor(graph.spark, graph.source, locals, Nil)
   }
 
@@ -482,35 +503,39 @@ class TraceCursor private[lineage] (
   /** Key hashes of the level's rows whose packed output id is in `idSet`. */
   private def keyHashesOf(level: KeyedSource, idSet: Set[Long]): Set[Int] =
     if (level.hasProbe) {
-      TitianSQL.tapBlocks[JoinBlock](spark, level.tapId).flatMap { b =>
-        b.pairs.indices.iterator.collect {
-          case i if idSet.contains(PackIntIntoLong(b.split, i)) =>
-            PackIntIntoLong.getLeft(b.pairs(i))
+      TitianSQL.mapBlocks(spark, level.tapId) { b =>
+        val (split, pairs) = TapBlock.joinPairs(b)
+        pairs.indices.iterator.collect {
+          case i if idSet.contains(PackIntIntoLong(split, i)) =>
+            PackIntIntoLong.getLeft(pairs(i))
         }
-      }.collect().toSet
+      }.toSet
     } else {
-      TitianSQL.tapBlocks[KeyedBlock](spark, level.tapId).flatMap { b =>
-        b.values.indices.iterator.collect {
-          case i if idSet.contains(PackIntIntoLong(b.split, i)) => b.values(i)
+      TitianSQL.mapBlocks(spark, level.tapId) { b =>
+        val (split, values) = TapBlock.keyedValues(b)
+        values.indices.iterator.collect {
+          case i if idSet.contains(PackIntIntoLong(split, i)) => values(i)
         }
-      }.collect().toSet
+      }.toSet
     }
 
   /** Packed output ids of the level's rows whose key hash is in `hashes`. */
   private def idsForKeyHashes(level: KeyedSource, hashes: Set[Int]): Array[Long] =
     if (level.hasProbe) {
-      TitianSQL.tapBlocks[JoinBlock](spark, level.tapId).flatMap { b =>
-        b.pairs.indices.iterator.collect {
-          case i if hashes.contains(PackIntIntoLong.getLeft(b.pairs(i))) =>
-            PackIntIntoLong(b.split, i)
+      TitianSQL.mapBlocks(spark, level.tapId) { b =>
+        val (split, pairs) = TapBlock.joinPairs(b)
+        pairs.indices.iterator.collect {
+          case i if hashes.contains(PackIntIntoLong.getLeft(pairs(i))) =>
+            PackIntIntoLong(split, i)
         }
-      }.collect()
+      }
     } else {
-      TitianSQL.tapBlocks[KeyedBlock](spark, level.tapId).flatMap { b =>
-        b.values.indices.iterator.collect {
-          case i if hashes.contains(b.values(i)) => PackIntIntoLong(b.split, i)
+      TitianSQL.mapBlocks(spark, level.tapId) { b =>
+        val (split, values) = TapBlock.keyedValues(b)
+        values.indices.iterator.collect {
+          case i if hashes.contains(values(i)) => PackIntIntoLong(split, i)
         }
-      }.collect()
+      }
     }
 
   /** One step backward; `branch` selects the join/union input at a multi-input level. */
@@ -530,21 +555,23 @@ class TraceCursor private[lineage] (
         case DirectBranch(_) =>
           // exact probe-row provenance: probeId lives in the post-join block, same
           // partition as the output row
-          TitianSQL.tapBlocks[JoinBlock](spark, tapId).flatMap { b =>
-            b.pairs.indices.iterator.collect {
-              case i if idSet.contains(PackIntIntoLong(b.split, i)) =>
-                PackIntIntoLong(b.split, PackIntIntoLong.getRight(b.pairs(i)))
+          TitianSQL.mapBlocks(spark, tapId) { b =>
+            val (split, pairs) = TapBlock.joinPairs(b)
+            pairs.indices.iterator.collect {
+              case i if idSet.contains(PackIntIntoLong(split, i)) =>
+                PackIntIntoLong(split, PackIntIntoLong.getRight(pairs(i)))
             }
-          }.collect().distinct
+          }.distinct
         case HashBranch(preTapId, _) =>
           val hashes = keyHashesOf(ks, idSet)
-          TitianSQL.tapBlocks[PreExchangeBlock](spark, preTapId).flatMap { b =>
+          TitianSQL.mapBlocks(spark, preTapId) { b =>
+            val (split, blockHashes, idLists) = TapBlock.preEntries(b)
             hashes.iterator.flatMap { h =>
-              val j = java.util.Arrays.binarySearch(b.hashes, h)
-              if (j >= 0) b.idLists(j).iterator.map(id => PackIntIntoLong(b.split, id))
+              val j = java.util.Arrays.binarySearch(blockHashes, h)
+              if (j >= 0) idLists(j).iterator.map(id => PackIntIntoLong(split, id))
               else Iterator.empty
             }
-          }.collect().distinct
+          }.distinct
       }
       new TraceCursor(spark, branches(branch).upstream, nextIds,
         (source, ids, branch) :: path)
@@ -560,22 +587,24 @@ class TraceCursor private[lineage] (
       val idSet = ids.toSet
       val parentIds = parent.branches(branch) match {
         case DirectBranch(_) =>
-          TitianSQL.tapBlocks[JoinBlock](spark, parent.tapId).flatMap { b =>
-            b.pairs.indices.iterator.collect {
+          TitianSQL.mapBlocks(spark, parent.tapId) { b =>
+            val (split, pairs) = TapBlock.joinPairs(b)
+            pairs.indices.iterator.collect {
               case i if idSet.contains(
-                  PackIntIntoLong(b.split, PackIntIntoLong.getRight(b.pairs(i)))) =>
-                PackIntIntoLong(b.split, i)
+                  PackIntIntoLong(split, PackIntIntoLong.getRight(pairs(i)))) =>
+                PackIntIntoLong(split, i)
             }
-          }.collect()
+          }
         case HashBranch(preTapId, _) =>
           val hashes =
-            TitianSQL.tapBlocks[PreExchangeBlock](spark, preTapId).flatMap { b =>
-              b.hashes.indices.iterator.collect {
-                case j if b.idLists(j)
-                  .exists(id => idSet.contains(PackIntIntoLong(b.split, id))) =>
-                  b.hashes(j)
+            TitianSQL.mapBlocks(spark, preTapId) { b =>
+              val (split, blockHashes, idLists) = TapBlock.preEntries(b)
+              blockHashes.indices.iterator.collect {
+                case j if idLists(j)
+                  .exists(id => idSet.contains(PackIntIntoLong(split, id))) =>
+                  blockHashes(j)
               }
-            }.collect().toSet
+            }.toSet
           idsForKeyHashes(parent, hashes)
       }
       new TraceCursor(spark, parent, parentIds, rest)

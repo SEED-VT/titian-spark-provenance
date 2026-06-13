@@ -30,8 +30,17 @@ import org.apache.spark.unsafe.hash.Murmur3_x86_32
  */
 object LineageHashing {
 
-  def hashKey(key: Any): Int = key match {
+  def hashKey(key: Any): Int =
+    if (TitianAblation.legacyHash) legacyHashKey(key)
+    else key match {
+      case null => 0
+      case k => Murmur3_x86_32.hashInt(k.hashCode(), 42)
+    }
+
+  // ablation: the fork's per-record toString + murmur over the bytes (P1a off)
+  private def legacyHashKey(key: Any): Int = key match {
     case null => 0
-    case k => Murmur3_x86_32.hashInt(k.hashCode(), 42)
+    case k => com.google.common.hash.Hashing.murmur3_32_fixed()
+      .hashString(k.toString, java.nio.charset.StandardCharsets.UTF_8).asInt()
   }
 }
