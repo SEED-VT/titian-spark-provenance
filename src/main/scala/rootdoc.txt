@@ -5,9 +5,36 @@ Spark — and captures fine-grained, record-level data lineage for RDD, Spark SQ
 DataFrame, and PySpark jobs. After a job runs you can trace any output record
 backward to the exact input records that produced it, and forward again.
 
-This is the API reference. Narrative docs live alongside the code:
+This is the API reference. Two browsable guides collect the operational surface:
+
+  - '''[[org.apache.spark.lineage.guide.CommandReference Command & flag catalog]]''' —
+    every sbt task, script, runtime flag, and environment variable in one place.
+  - '''[[org.apache.spark.lineage.guide.DeveloperGuide Developer guide]]''' —
+    architecture, code layout, and how to extend capture.
+
+Narrative docs live alongside the code:
 [[https://github.com/SEED-VT/titian-spark-provenance README]], `INSTALL.md`,
 `ABLATION.md`, and the `tpcds/` coverage harness.
+
+==Quick start (Spark SQL)==
+{{{
+// 1. register the extension at session build
+val spark = SparkSession.builder()
+  .config("spark.sql.extensions", "org.apache.spark.sql.lineage.TitianSQLExtension")
+  .config("spark.titian.sql.capture", "true")
+  .getOrCreate()
+
+// 2. run a query and collect rows with their lineage ids
+val df = spark.sql("SELECT category, SUM(amount) FROM sales GROUP BY category")
+val rowsWithIds = TitianSQL.collectWithLineage(df)
+
+// 3. trace one output row back to the exact source records
+val cursor = TitianSQL.trace(df, Seq(rowsWithIds.head._2))
+cursor.goBack().show().foreach(println)
+
+// 4. release the lineage when done
+TitianSQL.releaseLineage(df)
+}}}
 
 ==Where to start==
 
