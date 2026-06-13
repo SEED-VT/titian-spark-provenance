@@ -24,7 +24,7 @@ import org.apache.spark.SparkEnv
  * `spark.titian.ablation` lets you switch any one back to its pre-optimization
  * implementation — for the ablation study (measuring each one's contribution) or as a
  * fallback. All legacy paths are verified to produce byte-identical lineage to the
- * optimized ones (see ABLATION.md / scripts/verify_ablation.sh).
+ * optimized ones (see docs/ablation.md / scripts/verify_ablation.sh).
  *
  * `spark.titian.ablation` is a comma-separated list of:
  *  - `legacyHash`       — P1a: murmur over key.toString bytes (RDD side)

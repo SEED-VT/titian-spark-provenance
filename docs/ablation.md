@@ -64,4 +64,4 @@ sh scripts/verify_ablation.sh
 Spark auto-loads `spark.*` JVM system properties into `SparkConf`, so the script
 injects `-Dspark.titian.ablation=<flags>` into every forked test session. A green
 suite under a flag means that legacy path is semantically indistinguishable from the
-optimized one. Results in [`ABLATION_RESULTS.md`](ABLATION_RESULTS.md).
+optimized one. Results in [Ablation results](ablation-results.md).

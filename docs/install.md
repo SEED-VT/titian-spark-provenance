@@ -57,7 +57,7 @@ flag off the extension is a verified no-op.
 ## Notebooks
 
 Three end-to-end notebooks (SQL, PySpark + Python UDFs, RDD) live in
-[`notebooks/`](notebooks/).
+[`notebooks/`](https://github.com/SEED-VT/titian-spark-provenance/tree/main/notebooks).
 
 **Docker (recommended)** — fully self-contained, builds the jar from source:
 

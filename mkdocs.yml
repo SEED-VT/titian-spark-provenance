@@ -1,0 +1,66 @@
+site_name: Titian on Spark 4
+site_description: Record-level data provenance for Apache Spark 4
+site_url: https://seed-vt.github.io/titian-spark-provenance/
+repo_url: https://github.com/SEED-VT/titian-spark-provenance
+repo_name: SEED-VT/titian-spark-provenance
+docs_dir: docs
+
+theme:
+  name: material
+  icon:
+    repo: fontawesome/brands/github
+  features:
+    - navigation.sections
+    - navigation.top
+    - navigation.instant
+    - navigation.tracking
+    - content.code.copy
+    - toc.follow
+    - search.suggest
+    - search.highlight
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+
+nav:
+  - Home: index.md
+  - Usage: usage.md
+  - Getting started: install.md
+  - Command & flag reference: reference.md
+  - TPC-DS coverage: tpcds.md
+  - Ablation & performance:
+      - Tuning flags & study: ablation.md
+      - Results: ablation-results.md
+  - Developer guide: developer-guide.md
+  - API reference (Scaladoc): api/index.html
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.superfences
+  - pymdownx.inlinehilite
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+
+# The Scaladoc API site is generated separately (`sbt doc`) and copied into
+# docs/api/ before building, so it serves under /api/ alongside the manual:
+#   bin/sbt doc && rm -rf docs/api && cp -r target/scala-2.13/api docs/api && mkdocs build

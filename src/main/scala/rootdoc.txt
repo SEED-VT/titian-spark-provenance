@@ -5,16 +5,12 @@ Spark — and captures fine-grained, record-level data lineage for RDD, Spark SQ
 DataFrame, and PySpark jobs. After a job runs you can trace any output record
 backward to the exact input records that produced it, and forward again.
 
-This is the API reference. Two browsable guides collect the operational surface:
+This is the '''API reference''' (signatures, classes, capture-engine internals). The
+'''manual''' — usage, the command & flag reference, ablation/tuning, TPC-DS coverage,
+and a developer guide — is the navigable documentation site:
 
-  - '''[[org.apache.spark.lineage.guide.CommandReference Command & flag catalog]]''' —
-    every sbt task, script, runtime flag, and environment variable in one place.
-  - '''[[org.apache.spark.lineage.guide.DeveloperGuide Developer guide]]''' —
-    architecture, code layout, and how to extend capture.
-
-Narrative docs live alongside the code:
-[[https://github.com/SEED-VT/titian-spark-provenance README]], `INSTALL.md`,
-`ABLATION.md`, and the `tpcds/` coverage harness.
+  - [[https://seed-vt.github.io/titian-spark-provenance/ Documentation site]]
+  - [[https://github.com/SEED-VT/titian-spark-provenance Source on GitHub]]
 
 ==Quick start (Spark SQL)==
 {{{
@@ -79,7 +75,7 @@ filtering walk over those blocks.
 Five capture/trace optimizations are '''on by default'''. Each can be switched off
 individually with `spark.titian.ablation` — for the ablation study or as a fallback —
 and every legacy path is verified to produce byte-identical lineage. See
-[[org.apache.spark.lineage.TitianAblation]] and `ABLATION.md`.
+[[org.apache.spark.lineage.TitianAblation]] and the Ablation page of the docs site.
 
 `spark.titian.lineage.storageLevel` (default `MEMORY_AND_DISK_SER`) tunes where
 lineage blocks live; [[org.apache.spark.sql.lineage.TitianSQL.lineageSize]] reports a

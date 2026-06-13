@@ -48,7 +48,7 @@ package org.apache.spark
  * Five capture/trace optimizations are '''on by default'''. Each can be switched off
  * individually (comma-separated in `spark.titian.ablation`) for the ablation study or
  * as a fallback; every legacy path produces byte-identical lineage (verified by the
- * full suite under each flag — see `ABLATION.md`, `scripts/verify_ablation.sh`). The
+ * full suite under each flag — see `docs/ablation.md`, `scripts/verify_ablation.sh`). The
  * flag reader is `TitianAblation`.
  *
  *   - '''P1a''' `legacyHash` — key hash via `Murmur3.hashInt(key.hashCode)` instead of
