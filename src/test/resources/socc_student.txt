@@ -1,0 +1,6 @@
+a b male 18 0 CS
+c d female 19 0 EE
+e f male 20 0 CS
+g h male 99 0 CS
+i j female 22 1 ME
+k l male 21 1 ME

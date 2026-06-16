@@ -106,6 +106,19 @@ the cause does not):
 | ratio-per-key (0/0) | NaN/Null | the divide-by-zero record |
 | sum-per-key (two records cancel) | custom (`== 0`) | both records, 1-minimal |
 
+The **SoCC '17 subject programs** from the original BigSift evaluation
+([maligulzar/BigSiftUI](https://github.com/maligulzar/BigSiftUI)) are reproduced
+faithfully — same pipeline and the same `failure` oracle — in `SoccBenchmarksSuite`:
+
+| benchmark | pipeline | fault oracle | isolated |
+|---|---|---|---|
+| Airport Transit | layover time per airport-hour, transits < 45 min | `total < 0` | midnight-crossing transit |
+| Weather Analysis | per month/year, `max snow − min snow` | `delta > 6000 mm` | the anomalous snow reading |
+| Student Info | moving-average age per grade | `grade > 3 ∨ avg ∉ [18,25]` | the corrupt age |
+
+(AirQuality is an empty stub and WordCount carries no fault oracle in the original
+repo, so neither defines a debugging scenario.)
+
 ## Notes & limitations
 
 - **SQL/PySpark** require the base table to be a **file source** (Parquet/CSV) so
