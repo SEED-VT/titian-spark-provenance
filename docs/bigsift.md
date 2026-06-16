@@ -90,15 +90,37 @@ subset and applies the oracle to the output: if any output row is still faulty, 
 subset reproduces the failure. Distribution oracles (k-sigma, min/max) fix their
 threshold from the original full output so the predicate stays stable across re-runs.
 
+## Verified against the paper
+
+`BigSiftVerificationSuite` reproduces the FSE '18 airport program (Figure 5) and
+exercises every predefined oracle, each isolating the exact fault-inducing record with
+necessity + sufficiency checks (the cause alone reproduces the fault; the input minus
+the cause does not):
+
+| example | oracle | result |
+|---|---|---|
+| airport layover (Figure 5) | custom predicate (`total < 0`) | the midnight-crossing transit row |
+| airport layover | minimum-output | same row |
+| airport layover | k-sigma-from-median | same row |
+| max-per-key | maximum-output | the anomalous record |
+| ratio-per-key (0/0) | NaN/Null | the divide-by-zero record |
+| sum-per-key (two records cancel) | custom (`== 0`) | both records, 1-minimal |
+
 ## Notes & limitations
 
 - **SQL/PySpark** require the base table to be a **file source** (Parquet/CSV) so
   Titian captures its provenance; in-memory `LocalRelation` views are not captured.
   The query's referenced columns must appear in the traced witnesses (the common
   single-base-table case).
+- **RDD** jobs should read their input from a **file** (`lc.textFile`), as in the
+  paper (`sc.textFile(dataset)`); tracing a job whose source is `lc.parallelize` hits
+  a Titian replay-path edge case on shallow DAGs.
 - **RDD** provenance pre-shrink is **best-effort**: the trace is validated by
   re-running, and falls back to the full input if it under-resolves — so the isolated
   culprit is always correct, but the candidate set may not always be pre-shrunk.
+- Of the paper's three systems optimizations, **bitmap-based test memoization** is
+  implemented; **test-predicate pushdown** and **overlapping-trace prioritization**
+  (performance optimizations, not correctness) are not yet ported.
 - Delta debugging re-runs the job many times; cost scales with the candidate-set size,
   which is why the provenance pre-shrink matters. Test verdicts are memoized so no
   subset is re-tested.
