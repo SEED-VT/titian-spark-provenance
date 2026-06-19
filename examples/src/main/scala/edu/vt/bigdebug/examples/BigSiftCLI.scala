@@ -5,6 +5,8 @@ import org.apache.spark.lineage.LineageContext
 import org.apache.spark.lineage.LineageContext._
 import org.apache.spark.lineage.rdd.Lineage
 import org.apache.spark.bigsift.{BigSift, BigSiftResult, TestOracle}
+import org.apache.spark.sql.{Row, SparkSession}
+import org.apache.spark.sql.bigsift.BigSiftSQL
 
 /**
  * Interactive terminal front-end for BigSift — a CLI take on the FSE '18 web UI.
@@ -35,13 +37,13 @@ object BigSiftCLI {
   private final class Recorder {
     private val t0 = System.nanoTime()
     val steps = scala.collection.mutable.ArrayBuffer[Step]()
-    def onStep(subset: Seq[String]): Unit = {
+    def onSize(size: Int, sample: String): Unit = {
       val ms = (System.nanoTime() - t0) / 1000000
-      val step = Step(ms, subset.size, subset.headOption.getOrElse(""))
-      steps += step
-      println(s"  ${dim(f"t=$ms%4dms")}  ${cyan(f"localized ${step.size}%4d")} records" +
-        (if (step.sample.nonEmpty) s"   ${dim("e.g. " + step.sample)}" else ""))
+      steps += Step(ms, size, sample)
+      println(s"  ${dim(f"t=$ms%5dms")}  ${cyan(f"localized $size%7d")} records" +
+        (if (sample.nonEmpty) s"   ${dim("e.g. " + sample.take(60))}" else ""))
     }
+    def onStep(subset: Seq[String]): Unit = onSize(subset.size, subset.headOption.getOrElse(""))
   }
 
   // ---- subject programs (jobs in serializable objects) ----------------------
@@ -132,40 +134,73 @@ object BigSiftCLI {
 
   private def fmt(n: Long): String =
     if (n >= 1000000) s"${n / 1000000}M" else if (n >= 1000) s"${n / 1000}k" else n.toString
+  private def comma(n: Long): String =
+    n.abs.toString.reverse.grouped(3).map(_.reverse).toList.reverse.mkString(if (n < 0) "-" else "", ",", "")
 
-  // ---- area chart: records localized over time, log y with decade gridlines --
-  private def areaChart(steps: Seq[Step]): String = {
+  /**
+   * Records-localized over time, log y with decade gridlines. The reduction has two
+   * sources, colored distinctly:
+   *   - Titian data provenance (cyan): full input -> candidate set (one backward trace);
+   *   - delta debugging (green): candidate set -> 1-minimal (the staircase).
+   * The first step the recorder sees is the candidate set, so its time marks the
+   * Titian -> DD hand-off; everything before it is the capture+trace phase.
+   */
+  private def phasedChart(steps: Seq[Step], total: Int): String = {
     if (steps.isEmpty) return dim("  (no reduction steps)")
-    // normalize time to the reduction phase (first step = 0): the capture/provenance
-    // setup before the first reduction would otherwise flat-line most of the chart.
-    val tMin = steps.map(_.elapsedMs).min
-    val pts = steps.map(s => (s.elapsedMs - tMin, s.size))
-    val tMax = pts.map(_._1).max.max(1L)
-    val yMax = pts.map(_._2).max.max(1)
-    val w = 54
-    // log y, calibrated by decade: each 10x band gets `perDecade` rows of equal height,
-    // so 1->10 spans the same vertical space as 100k->1M (proper log calibration).
-    val perDecade = 2
+    val tProv = steps.head.elapsedMs
+    val tMax = steps.map(_.elapsedMs).max.max(1L)
+    val yMax = total.max(steps.map(_.size).max).max(1)
+    val w = 54; val perDecade = 2
     val decades = math.ceil(math.log10(yMax.toDouble)).toInt.max(1)
     val h = decades * perDecade
-    def sizeAt(t: Long) = pts.takeWhile(_._1 <= t).lastOption.map(_._2).getOrElse(pts.head._2)
-    val cols = (0 until w).map(ci => sizeAt(math.round(ci.toDouble / (w - 1) * tMax)))
+    def ddSizeAt(t: Long) = steps.takeWhile(_.elapsedMs <= t).lastOption.map(_.size).getOrElse(steps.head.size)
+    // (size, isTitianPhase) per column
+    val cols = (0 until w).map { ci =>
+      val t = math.round(ci.toDouble / (w - 1) * tMax)
+      if (t < tProv) (total, true) else (ddSizeAt(t), false)
+    }
     def barH(v: Int) = if (v <= 0) 0 else math.round(math.log10(v.toDouble) * perDecade).toInt
     val sb = new StringBuilder
     sb.append("  ").append(dim("records localized (log10 scale)")).append("\n")
     for (r <- h to 1 by -1) {
-      // label only on decade boundaries (every `perDecade` rows): 10, 100, 1k, …
       val label = if (r % perDecade == 0) fmt(math.pow(10, r / perDecade).toLong) else ""
-      val bar = cols.map(v => if (barH(v) >= r) green("█") else " ").mkString
+      val bar = cols.map { case (v, titian) =>
+        if (barH(v) >= r) (if (titian) cyan("█") else green("█")) else " " }.mkString
       sb.append(f"  $label%6s │").append(bar).append("\n")
     }
-    sb.append(f"  ${"1"}%6s └").append("─" * w).append("\n")  // baseline = 10^0 = 1 record
+    sb.append(f"  ${"1"}%6s └").append("─" * w).append("\n")
     sb.append(" " * 9).append("0").append(" " * (w - 10)).append(f"$tMax%5dms\n")
-    sb.append(" " * 9).append(dim(s"delta-debugging time → (after ${tMin}ms capture+trace)")).append("\n")
+    sb.append(" " * 9).append(dim("debugging time →   "))
+      .append(cyan("█ Titian provenance")).append("   ").append(green("█ delta debugging")).append("\n")
     sb.toString
   }
 
   // ---- run one session ------------------------------------------------------
+  private def render(title: String, dataDesc: String, oracle: String, total: Int,
+                     steps: Seq[Step], faulty: Seq[String], localized: Seq[String],
+                     provSize: Int, ms: Long): Unit = {
+    println()
+    println(phasedChart(steps, total))
+    // attribution: how much each source localized
+    val fromTitian = provSize < total
+    println(s"  ${bold("input")}             ${comma(total)} records")
+    if (fromTitian)
+      println(s"  ${cyan("Titian provenance")} ${comma(total)} → ${comma(provSize)}" +
+        dim("   (backward trace to the records feeding the faulty output)"))
+    else
+      println(s"  ${yellow("provenance")}        " +
+        dim(s"local full input — the RDD trace under-resolved, so DD ran over all ${comma(total)}"))
+    val ddRuns = (steps.size - 1).max(0)
+    println(s"  ${green("delta debugging")}   ${comma(provSize)} → ${comma(localized.size)}" +
+      dim(s"   ($ddRuns re-runs of the job on subsets)"))
+    println(s"  ${bold("faulty output(s):")} ${faulty.take(3).mkString(", ")}" +
+      (if (faulty.size > 3) dim(s"  (+${faulty.size - 3} more)") else ""))
+    println(s"  ${bold(green("fault-inducing input(s)"))} ${dim("(delta-debugging result):")}")
+    localized.foreach(row => println(s"      ${green(row)}"))
+    println(dim(s"  done in ${ms}ms"))
+    println()
+  }
+
   private def runSession(scenKey: String, oracleKey: String): Unit = {
     val sc = scenarios.getOrElse(scenKey, { println(red(s"unknown scenario '$scenKey'")); return })
     val oracle = if (sc.oracles.exists(_._1 == oracleKey)) oracleKey else sc.default
@@ -174,7 +209,7 @@ object BigSiftCLI {
     println()
     println(bold(cyan(s"▶ ${sc.title}")))
     println(dim(s"  data: ${sc.data}  ($total records)   oracle: ") + yellow(oracle))
-    println(dim("  delta debugging — localizing…"))
+    println(dim("  capturing lineage, tracing provenance, delta debugging…"))
 
     val spark = new SparkContext("local[4]", s"bigsift-cli-$scenKey")
     spark.setLogLevel("ERROR")
@@ -183,16 +218,59 @@ object BigSiftCLI {
     val t0 = System.nanoTime()
     val r = try sc.run(oracle, lc, rec.onStep) finally spark.stop()
     val ms = (System.nanoTime() - t0) / 1000000
+    render(sc.title, sc.data, oracle, total, rec.steps.toSeq, r.faulty, r.localized, r.provSize, ms)
+  }
 
-    println()
-    println(areaChart(rec.steps.toSeq))
-    println(s"  ${bold("faulty output(s):")} ${r.faulty.take(3).mkString(", ")}" +
-      (if (r.faulty.size > 3) dim(s"  (+${r.faulty.size - 3} more)") else ""))
-    println(s"  ${bold("candidates (provenance):")} ${r.provSize} of $total records")
-    println(s"  ${bold(green("fault-inducing input(s):"))}")
-    r.localized.foreach(row => println(s"      ${green(row)}"))
-    println(dim(s"  done in ${ms}ms over ${rec.steps.size} reduction steps"))
-    println()
+  // ---- run your own program: a SQL query over a CSV, no recompile -----------
+  private def cell(r: Row, c: Int): Double = r.get(c) match {
+    case n: Number => n.doubleValue
+    case null => Double.NaN
+    case s => try s.toString.toDouble catch { case _: Throwable => Double.NaN }
+  }
+
+  /** Build an output-row predicate from an oracle spec like `lt 1 0`, `max 1`, `nan 2`. */
+  private def parseOracle(spec: String, outputs: Array[Row]): Row => Boolean =
+    spec.trim.split("\\s+").toList match {
+      case "lt" :: c :: v :: Nil => (r: Row) => cell(r, c.toInt) < v.toDouble
+      case "gt" :: c :: v :: Nil => (r: Row) => cell(r, c.toInt) > v.toDouble
+      case "nan" :: c :: Nil => (r: Row) => { val x = cell(r, c.toInt); x.isNaN || r.isNullAt(c.toInt) }
+      case "min" :: c :: Nil => val m = outputs.map(cell(_, c.toInt)).min; (r: Row) => cell(r, c.toInt) <= m
+      case "max" :: c :: Nil => val m = outputs.map(cell(_, c.toInt)).max; (r: Row) => cell(r, c.toInt) >= m
+      case _ => throw new IllegalArgumentException(
+        s"oracle must be: lt|gt <col> <val> | min|max|nan <col>   (got '$spec')")
+    }
+
+  private def runSql(args: List[String]): Unit = args match {
+    case spec :: query :: oracleParts if spec.contains("=") =>
+      val Array(table, file) = spec.split("=", 2)
+      val oracle = oracleParts.mkString(" ")
+      println()
+      println(bold(cyan(s"▶ SQL: $query")))
+      println(dim(s"  table $table = $file   oracle: ") + yellow(oracle))
+      println(dim("  capturing lineage, tracing provenance, delta debugging…"))
+      val spark = SparkSession.builder().master("local[4]").appName("bigsift-sql")
+        .config("spark.sql.extensions", "org.apache.spark.sql.lineage.TitianSQLExtension")
+        .config("spark.titian.sql.capture", "false")
+        .config("spark.sql.shuffle.partitions", "8").getOrCreate()
+      spark.sparkContext.setLogLevel("ERROR")
+      try {
+        spark.read.option("header", "true").option("inferSchema", "true").csv(file)
+          .createOrReplaceTempView(table)
+        val total = spark.table(table).count().toInt
+        val test = parseOracle(oracle, spark.sql(query).collect())
+        val rec = new Recorder
+        val t0 = System.nanoTime()
+        val r = BigSiftSQL.debug(spark, table, query, test, sz => rec.onSize(sz, ""))
+        val ms = (System.nanoTime() - t0) / 1000000
+        render(s"SQL: $query", file, oracle, total, rec.steps.toSeq,
+          r.faultyOutputs.map(_.toString), r.faultInducingRows.map(_.toString),
+          r.provenanceSize, ms)
+      } catch { case e: Throwable => println(red(s"  error: ${e.getMessage}")) }
+      finally spark.stop()
+    case _ =>
+      println(dim("  usage: ") + "sql <table>=<file.csv> \"<SELECT … FROM table …>\" \"<oracle>\"")
+      println(dim("  oracle: ") + "lt|gt <outCol> <val> | min|max|nan <outCol>   (outCol is 0-based)")
+      println(dim("  example: ") + "sql sales=data.csv \"SELECT cat, SUM(amt) FROM sales GROUP BY cat\" \"lt 1 0\"")
   }
 
   // ---- menu + REPL ----------------------------------------------------------
@@ -204,12 +282,32 @@ object BigSiftCLI {
       s.oracles.foreach { case (ok, desc) => println(s"      ${cyan(ok.padTo(10, ' '))} $desc") }
     }
     println()
-    println(dim("  commands:  ") + s"${bold("run")} <scenario> [oracle]   ${bold("list")}   ${bold("help")}   ${bold("quit")}")
-    println(dim("  example:   ") + "run weather max")
+    println(s"  ${bold(yellow("sql".padTo(9, ' ')))} run your OWN query: " +
+      dim("sql <table>=<file.csv> \"<query>\" \"<oracle>\""))
+    println()
+    println(dim("  commands:  ") + s"${bold("run")} <scenario> [oracle]   ${bold("sql")} …   ${bold("list")}   ${bold("help")}   ${bold("quit")}")
+    println(dim("  examples:  ") + "run weather max   |   sql sales=data.csv \"SELECT c, SUM(a) FROM sales GROUP BY c\" \"lt 1 0\"")
+  }
+
+  /** Whitespace tokenizer that keeps double-quoted segments (SQL query, oracle) intact. */
+  private def tokenize(s: String): List[String] = {
+    val out = scala.collection.mutable.ListBuffer[String]()
+    val cur = new StringBuilder; var q = false
+    s.foreach {
+      case '"' => q = !q
+      case c if c.isWhitespace && !q => if (cur.nonEmpty) { out += cur.toString; cur.clear() }
+      case c => cur += c
+    }
+    if (cur.nonEmpty) out += cur.toString
+    out.toList
   }
 
   def main(args: Array[String]): Unit = {
-    if (args.nonEmpty) { runSession(args(0), args.lift(1).getOrElse("")); return }
+    if (args.nonEmpty) {
+      if (args(0) == "sql") runSql(args.tail.toList)
+      else runSession(args(0), args.lift(1).getOrElse(""))
+      return
+    }
     menu()
     var go = true
     while (go) {
@@ -219,8 +317,8 @@ object BigSiftCLI {
         case Some("") =>
         case Some("help") | Some("list") => menu()
         case Some(line) =>
-          val parts = line.split("\\s+").filter(_.nonEmpty).toList
-          parts match {
+          tokenize(line) match {
+            case "sql" :: rest => runSql(rest)
             case "run" :: s :: rest => runSession(s, rest.headOption.getOrElse(""))
             case s :: rest if scenarios.contains(s) => runSession(s, rest.headOption.getOrElse(""))
             case _ => println(red(s"  ? unknown command: $line") + dim("   (try 'help')"))

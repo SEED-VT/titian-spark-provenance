@@ -70,7 +70,8 @@ object BigSiftSQL {
       spark: SparkSession,
       baseTable: String,
       query: String,
-      test: Row => Boolean): BigSiftSQLResult = {
+      test: Row => Boolean,
+      onProgress: Int => Unit = _ => ()): BigSiftSQLResult = {
 
     val base = spark.table(baseTable)
     val basePath = filePathOf(spark, baseTable)
@@ -112,7 +113,8 @@ object BigSiftSQL {
       try spark.sql(query).collect().exists(test) finally base.createOrReplaceTempView(baseTable)
     }
     val causeRids =
-      if (candidates.nonEmpty && reproduces(candidates)) DeltaDebug.ddmin(candidates)(reproduces)
+      if (candidates.nonEmpty && reproduces(candidates))
+        DeltaDebug.ddmin(candidates, (s: Seq[Long]) => onProgress(s.size))(reproduces)
       else candidates
 
     val causeRows = withRid.filter(col("__rid").isInCollection(causeRids.toSet))

@@ -37,9 +37,41 @@ bigsift> run weather max
       90210,25/12/2015,90in
 ```
 
-Commands: `run <scenario> [oracle]`, `list`, `help`, `quit`. Toggle the oracle by
-choosing a different function (e.g. `min`, `max`, `ksigma`) — the menu lists the ones
+Commands: `run <scenario> [oracle]`, `sql …`, `list`, `help`, `quit`. Toggle the oracle
+by choosing a different function (e.g. `min`, `max`, `ksigma`) — the menu lists the ones
 each scenario supports.
+
+The reduction is colored by **source**: the chart and the breakdown separate **Titian
+data provenance** (cyan — the backward trace shrinking the full input to the records
+feeding the faulty output) from **delta debugging** (green — re-running the job on
+subsets down to the 1-minimal set). When the RDD trace under-resolves, BigSift falls
+back to the **local** full input and says so:
+
+```text
+  input             100,000 records
+  Titian provenance 100,000 → 22,629   (backward trace to the records feeding the fault)
+  delta debugging   22,629 → 2         (13 re-runs of the job on subsets)
+```
+
+### Run your own program (SQL, no recompile)
+
+The `sql` command runs BigSift on *your* query over a CSV — nothing to compile:
+
+```bash
+bin/bigsift sql sales=data.csv \
+  "SELECT category, SUM(amount) AS total FROM sales GROUP BY category" \
+  "lt 1 0"                         # output column 1 (total) < 0 is faulty
+```
+
+Oracle spec: `lt|gt <outCol> <val>` (threshold on an output column) or
+`min|max|nan <outCol>` (the predefined oracles), `outCol` 0-based. The CSV is read with
+a header; the base table is named by the `table=file` argument and referenced in the
+query. (Same engine as [`BigSiftSQL.debug`](#spark-sql-dataframes) — file-backed source,
+exact provenance.)
+
+For a PySpark job, `BigSift(spark).debug(table, query, lambda)` is the runtime
+equivalent; for a Scala RDD closure, add a one-line `Scenario` (below) or call
+`BigSift.run` from a small `main`.
 
 The demo datasets are generated on first run (1,000,000 rows each by default; a 1M-row
 job localizes in ~10–15 s). Regenerate at a different scale with
