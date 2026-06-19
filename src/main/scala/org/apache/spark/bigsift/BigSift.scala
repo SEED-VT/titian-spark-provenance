@@ -20,7 +20,7 @@ package org.apache.spark.bigsift
 import scala.reflect.ClassTag
 
 import org.apache.spark.lineage.LineageContext
-import org.apache.spark.lineage.rdd.{Lineage, LineageRDD, TapHadoopLRDD, TapParallelCollectionLRDD}
+import org.apache.spark.lineage.rdd.{Lineage, LineageRDD}
 
 /**
  * Outcome of a BigSift debugging session.
@@ -78,7 +78,7 @@ class BigSift(lc: LineageContext) extends Serializable {
       input: Lineage[String],
       job: Lineage[String] => Lineage[T],
       test: T => Boolean,
-      onProgress: Int => Unit = _ => ()): BigSiftResult[T] = {
+      onProgress: Seq[String] => Unit = (_: Seq[String]) => ()): BigSiftResult[T] = {
 
     // 1. capture run: execute the job once with lineage on, collect outputs + ids
     lc.setCaptureLineage(true)
@@ -154,7 +154,8 @@ class BigSift(lc: LineageContext) extends Serializable {
   def runWithOracle[T: ClassTag](
       input: Lineage[String],
       job: Lineage[String] => Lineage[T],
-      oracle: Seq[T] => (T => Boolean)): BigSiftResult[T] = {
+      oracle: Seq[T] => (T => Boolean),
+      onProgress: Seq[String] => Unit = (_: Seq[String]) => ()): BigSiftResult[T] = {
     lc.setCaptureLineage(true)
     val out = job(input)
     val withIds = out.collectWithId()
@@ -179,7 +180,7 @@ class BigSift(lc: LineageContext) extends Serializable {
       }
     }
 
-    val cause = DeltaDebug.ddmin(candidates)(reproduces)
+    val cause = DeltaDebug.ddmin(candidates, onProgress)(reproduces)
     BigSiftResult(cause, faulty.map(_._1).toVector, candidates.size)
   }
 

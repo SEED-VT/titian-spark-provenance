@@ -10,6 +10,37 @@ user **test oracle**, with bitmap-memoized test verdicts.
 You give it a **job**, a **test oracle** (a predicate marking output records faulty),
 and the **input**; it returns the minimal fault-inducing input records.
 
+## Interactive CLI
+
+`bin/bigsift` is a terminal front-end (a CLI take on the FSE '18 web UI): pick a subject
+program and a test-oracle function, and it streams the delta-debugging progression live,
+renders an area chart of records-localized over time (log y, as in the paper), and shows
+the localized records.
+
+```text
+$ bin/bigsift airport min            # one-shot: scenario + oracle
+$ bin/bigsift                        # interactive menu / REPL
+
+bigsift> run weather max
+▶ Weather analysis — snow delta per month/year
+  t=   0ms  localized  252 records   e.g. 90210,15/12/2015,15mm
+  t= 243ms  localized  126 records   e.g. 60601,16/12/2015,25mm
+  ...
+  records localized (log scale)
+    252 │████████
+     56 │███████████████████████
+      2 │██████████████████████████████████████████████████████
+       └──────────────────────────────────────────────────────
+        0                                              887ms
+        delta-debugging time → (after 5260ms capture+trace)
+  fault-inducing input(s):
+      90210,25/12/2015,90in
+```
+
+Commands: `run <scenario> [oracle]`, `list`, `help`, `quit`. Toggle the oracle by
+choosing a different function (e.g. `min`, `max`, `ksigma`) — the menu lists the ones
+each scenario supports.
+
 ```
 input + job + test  ──►  run with capture  ──►  faulty outputs (per test)
                                 │

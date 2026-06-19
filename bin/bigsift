@@ -1,0 +1,37 @@
+#!/bin/sh
+# Launcher for the BigSift CLI. Runs java directly (not via sbt) so stdin connects to
+# the interactive menu; pins the project-local JDK 17 and the Spark 4 module opens.
+#
+#   bin/bigsift                 # interactive menu / REPL
+#   bin/bigsift weather max     # one-shot: run a scenario with an oracle
+set -e
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+export JAVA_HOME="$ROOT/tools/jdk-17.0.19+10/Contents/Home"
+
+CPFILE="$ROOT/examples/target/bigsift.classpath"
+NEWER=$(find "$ROOT/examples/src" "$ROOT/src" -name '*.scala' -newer "$CPFILE" 2>/dev/null | head -1)
+if [ ! -f "$CPFILE" ] || [ -n "$NEWER" ]; then
+  echo "compiling…" >&2
+  "$ROOT/bin/sbt" -batch examples/compile >/dev/null
+  "$ROOT/bin/sbt" -batch --error 'export examples/Runtime/fullClasspath' 2>/dev/null \
+    | tail -1 > "$CPFILE"
+fi
+
+cd "$ROOT"
+exec "$JAVA_HOME/bin/java" \
+  --add-opens=java.base/java.lang=ALL-UNNAMED \
+  --add-opens=java.base/java.lang.invoke=ALL-UNNAMED \
+  --add-opens=java.base/java.lang.reflect=ALL-UNNAMED \
+  --add-opens=java.base/java.io=ALL-UNNAMED \
+  --add-opens=java.base/java.net=ALL-UNNAMED \
+  --add-opens=java.base/java.nio=ALL-UNNAMED \
+  --add-opens=java.base/java.util=ALL-UNNAMED \
+  --add-opens=java.base/java.util.concurrent=ALL-UNNAMED \
+  --add-opens=java.base/java.util.concurrent.atomic=ALL-UNNAMED \
+  --add-opens=java.base/jdk.internal.ref=ALL-UNNAMED \
+  --add-opens=java.base/sun.nio.ch=ALL-UNNAMED \
+  --add-opens=java.base/sun.nio.cs=ALL-UNNAMED \
+  --add-opens=java.base/sun.security.action=ALL-UNNAMED \
+  --add-opens=java.base/sun.util.calendar=ALL-UNNAMED \
+  -cp "$(cat "$CPFILE")" \
+  edu.vt.bigdebug.examples.BigSiftCLI "$@"

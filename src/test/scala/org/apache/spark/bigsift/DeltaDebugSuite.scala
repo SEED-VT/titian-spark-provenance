@@ -48,7 +48,7 @@ class DeltaDebugSuite extends AnyFunSuite with Matchers {
 
   test("progress callback is monotonically non-increasing") {
     val sizes = scala.collection.mutable.ArrayBuffer[Int]()
-    DeltaDebug.ddmin((1 to 100).toVector, sizes += _)(_.contains(42))
+    DeltaDebug.ddmin((1 to 100).toVector, (s: Seq[Int]) => sizes += s.size)(_.contains(42))
     sizes.toSeq should equal (sizes.sorted.reverse.toSeq)
   }
 

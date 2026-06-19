@@ -42,10 +42,11 @@ object DeltaDebug {
    * @param items    the candidate failure-inducing elements (e.g. provenance records)
    * @param failing  true iff the given subset still reproduces the failure
    * @param onProgress optional callback after each accepted reduction, with the current
-   *                   candidate size (BigSift's UI streams this)
+   *                   candidate subset (BigSift's UI streams this — its size is the
+   *                   number of still-localized records, its head a sample)
    * @return a 1-minimal failing subset, in the original element order
    */
-  def ddmin[A](items: Seq[A], onProgress: Int => Unit = _ => ())(
+  def ddmin[A](items: Seq[A], onProgress: Seq[A] => Unit = (_: Seq[A]) => ())(
       failing: Seq[A] => Boolean): Seq[A] = {
     val all = items.toVector
     val memo = new Memo
@@ -56,10 +57,13 @@ object DeltaDebug {
       failing(indices.toVector.map(all))
     })
 
+    def report(set: BitSet): Unit = onProgress(set.toVector.map(all))
+
     // The whole candidate set must reproduce the failure, or there is nothing to
     // minimize — return it unchanged rather than silently emptying it.
     val full = BitSet(all.indices: _*)
     if (all.isEmpty || !testFails(full)) return items
+    report(full)
 
     var cFail = full
     var n = 2
@@ -72,13 +76,13 @@ object DeltaDebug {
       partitions.find(testFails) match {
         case Some(sub) =>
           cFail = sub; n = 2; progress = true
-          onProgress(cFail.size)
+          report(cFail)
         case None =>
           // reduce to a complement that still fails
           partitions.iterator.map(p => cFail.diff(p)).find(c => c.nonEmpty && testFails(c)) match {
             case Some(comp) =>
               cFail = comp; n = math.max(n - 1, 2); progress = true
-              onProgress(cFail.size)
+              report(cFail)
             case None =>
               if (n < cFail.size) { n = math.min(n * 2, cFail.size); progress = true }
           }

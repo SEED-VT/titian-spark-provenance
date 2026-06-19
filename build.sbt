@@ -74,5 +74,7 @@ lazy val examples = (project in file("examples"))
     Compile / run / fork := true,
     Compile / run / javaOptions ++= sparkJavaOptions,
     // run example mains from the repo root so relative paths (tpcds/data, ...) work
-    Compile / run / baseDirectory := (ThisBuild / baseDirectory).value
+    Compile / run / baseDirectory := (ThisBuild / baseDirectory).value,
+    // forward stdin to the forked JVM so interactive mains (BigSiftCLI) read input
+    Compile / run / connectInput := true
   )
