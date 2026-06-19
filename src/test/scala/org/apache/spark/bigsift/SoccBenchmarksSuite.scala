@@ -61,7 +61,7 @@ class SoccBenchmarksSuite extends AnyFunSuite with LocalLineageContext with Matc
   test("Weather Analysis — isolates the anomalous snow reading (delta > 6000mm)") {
     val bs = ctx("socc-weather")
     val csv = "src/test/resources/socc_weather.csv"
-    val corrupt = "90210,12/25/2015,50000mm"
+    val corrupt = "90210,12/25/2015,90in"
     val r = bs.run(lc.textFile(csv, 2), SoccBenchmarks.weatherJob,
       (o: (String, Float)) => o._2 > 6000f)
 

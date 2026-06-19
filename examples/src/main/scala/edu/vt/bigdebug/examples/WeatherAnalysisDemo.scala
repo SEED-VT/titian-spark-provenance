@@ -9,10 +9,15 @@ import org.apache.spark.bigsift.BigSift
 /**
  * BigSift on the SoCC '17 Weather Analysis benchmark (maligulzar/BigSiftUI).
  *
- * Input rows are `zip,date,snow` (snow as e.g. `100mm` or `12in`). For each month-date
+ * Input rows are `zip,date,snow` (snow as e.g. `100mm` or `0.4ft`). For each month-date
  * and each year, the job computes the snow delta `max - min`; a delta over 6000 mm is
- * treated as an anomaly. One corrupt reading (`50000mm`) blows up the delta, and
- * BigSift isolates the record(s) responsible.
+ * treated as an anomaly.
+ *
+ * The injected fault is a `90in` reading (90 inches of snow). `convert_to_mm` has the
+ * original's bug — it treats every non-`mm` unit as *feet* (`× 304.8`), so `90in`
+ * becomes 27432 mm instead of 2286 mm, blowing the delta past 6000. BigSift isolates
+ * that `90in` record (plus a low companion reading, since the fault is a max−min
+ * delta).
  *
  *   bin/sbt 'examples/runMain edu.vt.bigdebug.examples.WeatherAnalysisDemo'
  */
@@ -25,15 +30,25 @@ object WeatherAnalysisDemo {
     if (unit == "mm") v else v * 304.8f
   }
 
-  /** per month-date and per year: delta = max snow - min snow. */
+  /**
+   * Per month-date and per year: delta = max snow - min snow.
+   *
+   * Parsing is defensive (malformed lines are skipped). Besides being good practice,
+   * this keeps BigSift's delta-debugging re-runs clean: on the RDD path BigSift
+   * validates its provenance by re-running the job, and a best-effort trace can hand
+   * back a non-source string — without the guard the parser would throw (caught by
+   * BigSift, but noisily logged by Spark).
+   */
   def job(in: Lineage[String]): Lineage[(String, Float)] =
     in.flatMap { s =>
-      val t = s.split(",")
-      val date = t(1)
-      val snow = toMm(t(2))
-      val year = date.substring(date.lastIndexOf("/"))
-      val monthDate = date.substring(0, date.lastIndexOf("/") - 1)
-      Iterator((monthDate, snow), (year, snow))
+      try {
+        val t = s.split(",")
+        val date = t(1)
+        val snow = toMm(t(2))
+        val slash = date.lastIndexOf("/")
+        if (slash < 1) Iterator.empty
+        else Iterator((date.substring(0, slash - 1), snow), (date.substring(slash), snow))
+      } catch { case _: Throwable => Iterator.empty }
     }.groupByKey().map { case (k, vs) => (k, vs.max - vs.min) }
 
   def main(args: Array[String]): Unit = {
