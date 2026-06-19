@@ -8,6 +8,12 @@ set -e
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 export JAVA_HOME="$ROOT/tools/jdk-17.0.19+10/Contents/Home"
 
+# generate the demo datasets on first run (BIGSIFT_ROWS rows each, default 1,000,000)
+if [ ! -f "$ROOT/examples/data/airport.csv" ] || [ ! -f "$ROOT/examples/data/weather.csv" ] \
+   || [ ! -f "$ROOT/examples/data/student.txt" ]; then
+  "$ROOT/tools/python/bin/python3" "$ROOT/examples/data/generate.py" "${BIGSIFT_ROWS:-1000000}" >&2
+fi
+
 CPFILE="$ROOT/examples/target/bigsift.classpath"
 NEWER=$(find "$ROOT/examples/src" "$ROOT/src" -name '*.scala' -newer "$CPFILE" 2>/dev/null | head -1)
 if [ ! -f "$CPFILE" ] || [ -n "$NEWER" ]; then
@@ -19,6 +25,7 @@ fi
 
 cd "$ROOT"
 exec "$JAVA_HOME/bin/java" \
+  -Xmx"${BIGSIFT_HEAP:-6g}" \
   --add-opens=java.base/java.lang=ALL-UNNAMED \
   --add-opens=java.base/java.lang.invoke=ALL-UNNAMED \
   --add-opens=java.base/java.lang.reflect=ALL-UNNAMED \

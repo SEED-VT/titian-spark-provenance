@@ -55,7 +55,7 @@ object WeatherAnalysisDemo {
     val sc = new SparkContext("local[2]", "weather-analysis-demo")
     sc.setLogLevel("ERROR")
     val lc = new LineageContext(sc)
-    val data = if (args.nonEmpty) args(0) else "examples/data/weather.csv"
+    val data = if (args.nonEmpty) args(0) else "src/test/resources/socc_weather.csv"
 
     println("=== Weather Analysis: explain the anomalous snow delta (> 6000mm) ===")
     val r = new BigSift(lc).run(

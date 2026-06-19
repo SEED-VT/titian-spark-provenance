@@ -23,3 +23,8 @@ tpcds/ablation.csv
 # generated docs sites (build artifacts)
 site/
 docs/api/
+
+# BigSift CLI generated datasets (run examples/data/generate.py)
+examples/data/airport.csv
+examples/data/weather.csv
+examples/data/student.txt

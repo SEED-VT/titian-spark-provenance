@@ -41,6 +41,51 @@ Commands: `run <scenario> [oracle]`, `list`, `help`, `quit`. Toggle the oracle b
 choosing a different function (e.g. `min`, `max`, `ksigma`) — the menu lists the ones
 each scenario supports.
 
+The demo datasets are generated on first run (1,000,000 rows each by default; a 1M-row
+job localizes in ~10–15 s). Regenerate at a different scale with
+`python3 examples/data/generate.py <rows>` or `BIGSIFT_ROWS=<n> bin/bigsift …`; tune the
+JVM heap with `BIGSIFT_HEAP=8g`. The reduction chart's y-axis is log scale with decade
+gridlines (1, 10, 100, 1k, …), as in the paper's Figure 2c.
+
+### Adding a subject program
+
+A program is one `Scenario` entry in `BigSiftCLI`. Three steps:
+
+1. **Write the job** in the `Jobs` object — a `Lineage[String] => Lineage[T]`
+   transformation (defensive parsing keeps the delta-debugging re-runs clean):
+
+    ```scala
+    def sales(in: Lineage[String]): Lineage[(String, Int)] =
+      in.flatMap { s => try { val t = s.split(","); Iterator((t(0), t(1).toInt)) }
+                        catch { case _: Throwable => Iterator.empty } }
+        .reduceByKey(_ + _)
+    ```
+
+2. **Register a `Scenario`** in the `scenarios` list — key, title, data path, the
+   oracles it supports, the default oracle, and a lambda mapping each oracle to a
+   `BigSift.run` / `runWithOracle` call:
+
+    ```scala
+    Scenario("sales", "Sales totals per category", "examples/data/sales.csv",
+      Seq("negative" -> "total < 0 (default)", "min" -> "explain the minimum"),
+      "negative",
+      (oracle, lc, on) => {
+        val in = lc.textFile("examples/data/sales.csv", 4); val bs = new BigSift(lc)
+        type O = (String, Int)
+        res(oracle match {
+          case "min" => bs.runWithOracle[O](in, Jobs.sales, TestOracle.min(_._2.toDouble), on)
+          case _     => bs.run[O](in, Jobs.sales, _._2 < 0, on)
+        })
+      })
+    ```
+
+3. **(Optional) add data** to `examples/data/generate.py` so it scales with the others.
+
+That's it — `bin/bigsift sales` (or `run sales` in the REPL) now works, with the live
+chart and oracle toggling for free. The same `Jobs.sales` + oracle also drive
+`BigSift.run` directly in application code, or `BigSiftSQL.debug` if you express the job
+as SQL.
+
 ```
 input + job + test  ──►  run with capture  ──►  faulty outputs (per test)
                                 │

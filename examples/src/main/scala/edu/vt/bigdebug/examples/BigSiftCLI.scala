@@ -130,7 +130,10 @@ object BigSiftCLI {
       })
   ).map(s => s.key -> s).toMap
 
-  // ---- area chart: records localized (log y) over time ----------------------
+  private def fmt(n: Long): String =
+    if (n >= 1000000) s"${n / 1000000}M" else if (n >= 1000) s"${n / 1000}k" else n.toString
+
+  // ---- area chart: records localized over time, log y with decade gridlines --
   private def areaChart(steps: Seq[Step]): String = {
     if (steps.isEmpty) return dim("  (no reduction steps)")
     // normalize time to the reduction phase (first step = 0): the capture/provenance
@@ -139,21 +142,26 @@ object BigSiftCLI {
     val pts = steps.map(s => (s.elapsedMs - tMin, s.size))
     val tMax = pts.map(_._1).max.max(1L)
     val yMax = pts.map(_._2).max.max(1)
-    val (w, h) = (54, 11)
+    val w = 54
+    // log y, calibrated by decade: each 10x band gets `perDecade` rows of equal height,
+    // so 1->10 spans the same vertical space as 100k->1M (proper log calibration).
+    val perDecade = 2
+    val decades = math.ceil(math.log10(yMax.toDouble)).toInt.max(1)
+    val h = decades * perDecade
     def sizeAt(t: Long) = pts.takeWhile(_._1 <= t).lastOption.map(_._2).getOrElse(pts.head._2)
     val cols = (0 until w).map(ci => sizeAt(math.round(ci.toDouble / (w - 1) * tMax)))
-    val logMax = math.log10(yMax.toDouble).max(1e-6)
-    def barH(v: Int) = if (v <= 0) 0 else math.round(math.log10(v.toDouble) / logMax * h).toInt
+    def barH(v: Int) = if (v <= 0) 0 else math.round(math.log10(v.toDouble) * perDecade).toInt
     val sb = new StringBuilder
-    sb.append("  ").append(dim("records localized (log scale)")).append("\n")
+    sb.append("  ").append(dim("records localized (log10 scale)")).append("\n")
     for (r <- h to 1 by -1) {
-      val rowVal = math.round(math.pow(10, r.toDouble / h * logMax)).toInt
+      // label only on decade boundaries (every `perDecade` rows): 10, 100, 1k, …
+      val label = if (r % perDecade == 0) fmt(math.pow(10, r / perDecade).toLong) else ""
       val bar = cols.map(v => if (barH(v) >= r) green("█") else " ").mkString
-      sb.append(f"  ${rowVal}%5d │").append(bar).append("\n")
+      sb.append(f"  $label%6s │").append(bar).append("\n")
     }
-    sb.append("       └").append("─" * w).append("\n")
-    sb.append("        0").append(" " * (w - 10)).append(f"$tMax%5dms\n")
-    sb.append("        ").append(dim(s"delta-debugging time → (after ${tMin}ms capture+trace)")).append("\n")
+    sb.append(f"  ${"1"}%6s └").append("─" * w).append("\n")  // baseline = 10^0 = 1 record
+    sb.append(" " * 9).append("0").append(" " * (w - 10)).append(f"$tMax%5dms\n")
+    sb.append(" " * 9).append(dim(s"delta-debugging time → (after ${tMin}ms capture+trace)")).append("\n")
     sb.toString
   }
 
